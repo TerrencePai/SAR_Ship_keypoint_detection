@@ -1,0 +1,1338 @@
+nohup: ignoring input
+Namespace(batch_size=128, checkpoint='', descriptor='SuperPoint+Boost-B-attlay3', eval_interval=5, expand_piexl=5, lr=0.001, multiprocessing_context='spawn', num_epochs=100, num_workers=4, print_interval=5, random_seed=0, save_interval=10, save_path='work_dirs/SuperPoint+Boost-B-attlay3_best_model_weights_scratch_decay.pth', test=False, test_image='', test_threshold=None, test_threshold_mul=1, train_ratio=1.0, warmup_step=20)
+>>> device: cuda!
+>>> {'descriptor_dim': 256, 'keypoint_encoder': [32, 64, 128, 256], 'Attentional_layers': 3, 'last_activation': 'tanh', 'l2_normalization': False, 'output_dim': 256, 'keypoint_dim': 3, 'descriptor_encoder': [256, 256]}
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, MultiStepLR, ChainedScheduler
+from extract_features import normalize_keypoints, extractor_build, extract_img_feature
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, average_precision_score, precision_recall_curve
+from FeatureBooster.featurebooster import FeatureBooster, MLP
+from mmengine.analysis import get_model_complexity_info
+from torch.utils.data import DataLoader, Dataset
+from torch.nn.utils.rnn import pad_sequence
+from torch.nn.utils import clip_grad_norm_
+from mmdet.models.losses import FocalLoss
+from mmengine.dataset import Compose
+from sklearn.cluster import DBSCAN
+import multiprocessing as mp
+from os import path as osp
+from pathlib import Path
+from torch import nn
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # 设置Agg为后端
+import matplotlib.pyplot as plt
+import warnings
+import argparse
+import shutil
+import hashlib
+import random
+import torch
+import time
+import glob
+import yaml
+import cv2
+import os
+warnings.filterwarnings('ignore')
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Extract feature and refine descriptor using neural network to find ship keypoint.")
+    
+    parser.add_argument(
+        '--descriptor', type=str, default='SuperPoint+Boost-B',
+        help='descriptor to extract' )
+    
+    parser.add_argument(
+        '--num_epochs', type=int, default=100,)
+    
+    parser.add_argument(
+        '--train_ratio', type=float, default=1.0,
+        help='The ratio of data used for training out of the training set' )    
+
+    parser.add_argument(
+        '--batch_size', type=int, default=128,)
+    
+    parser.add_argument(
+        '--num_workers', type=int, default=4,)
+
+    parser.add_argument(
+        '--print_interval', type=int, default=5,)
+
+    parser.add_argument(
+        '--eval_interval', type=int, default=5,)
+    
+    parser.add_argument(
+        '--save_interval', type=int, default=10,)
+
+    parser.add_argument(
+        '--lr', type=float, default=1e-3,)
+
+    parser.add_argument(
+        '--warmup_step', type=int, default=20,)
+
+    parser.add_argument(
+        '--random_seed', type=int, default=0,)
+
+    parser.add_argument(
+        '--expand_piexl', type=int, default=5,)
+
+    parser.add_argument(
+        '--test_threshold_mul', type=float, default=1,)
+    
+    parser.add_argument(
+        '--test_threshold', type=float, default=None,)
+           
+    parser.add_argument(
+        '--test_image', type=str, default='' ,)
+    
+    parser.add_argument(
+        '--test', action='store_true',)
+    
+    parser.add_argument(
+        '--save_path', type=str, default='',)
+    
+    parser.add_argument(
+        '--checkpoint', type=str, default='',)
+
+    parser.add_argument(
+        '--multiprocessing_context', type=str, default=None,)
+        
+    args = parser.parse_args()
+    return args
+
+def calculate_md5(file_path):
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        # 以块的方式读取文件，以防文件太大
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+# 定义舰船目标关键点检测模型（示例）
+class ShipKeyPointsModel(nn.Module):
+    def __init__(self, descriptor, device='cpu', pretrained =''):
+        super().__init__() 
+        self.device = device       
+        # load json config file
+        config_file = Path(__file__).parent / "config.yaml"
+        with open(str(config_file), 'r') as f:
+            config = yaml.load(f, Loader=yaml.FullLoader)
+        self.config = config[descriptor]
+        self.k = nn.Parameter(torch.tensor(1.0))
+        # Model
+        self.feature_booster = FeatureBooster(self.config)
+        # load the model
+        if os.path.isfile(pretrained):
+            self.feature_booster.load_state_dict(torch.load(pretrained))
+            print(f">>> feature_booster weights loaded from {pretrained}!")
+        self.fc_out = MLP([self.config['output_dim'], self.config['output_dim']//2,1])
+        self.fc_thed = MLP([self.config['output_dim'], self.config['output_dim']//2,1])
+        self.to(self.device)
+        
+    def forward(self, x):
+        x = self.feature_booster(x[...,self.config['keypoint_dim']:], x[...,:self.config['keypoint_dim']])
+        x = (self.fc_out(x)-self.fc_thed(torch.mean(x,dim=-2,keepdim=True))).squeeze(-1)
+        return torch.sigmoid(self.k* x)
+    
+# 定义数据集（示例）
+class ShipKeyPointsDataset(Dataset):
+    def __init__(self, data_root, descriptor, expand_piexl = 5, pipeline = [], img_suffix = 'png', debug = False, device = torch.device('cpu'), **kwargs):
+        super(ShipKeyPointsDataset, self).__init__()
+        self.transform = Compose(pipeline)  
+        self.expand_piexl = expand_piexl
+        self.debug = debug
+        self.img_suffix = img_suffix
+        self.descriptor = descriptor
+        self.device = device
+        config_file = Path(__file__).parent / "config.yaml"
+        with open(str(config_file), 'r') as f:
+            config = yaml.load(f, Loader=yaml.FullLoader)
+        self.config = config[descriptor]
+        self.extractor = extractor_build(self.descriptor, device = self.device)
+        if 'ann_file' in kwargs and kwargs['ann_file'] !='': 
+            # train case  
+            ann_dir = kwargs['ann_file']
+            if isinstance(ann_dir, str):
+                ann_dir = [ann_dir]
+        else:
+            ann_dir = []
+        self.txt_files = []
+        for path in ann_dir:
+            self.txt_files.extend(glob.glob(osp.join(data_root, path, "**/*.txt"), recursive=True))
+
+        if 'train_ratio' in kwargs:
+            self.txt_files = random.sample(self.txt_files, int(np.ceil(len(self.txt_files)*kwargs['train_ratio'])))
+
+    def __len__(self):
+        return len(self.txt_files)
+
+    def load_data_info(self, idx):
+        data_info = {}
+        txt_file = self.txt_files[idx]
+        img_id = osp.split(txt_file)[1][:-4]
+        data_info['img_id'] = img_id
+        img_name = img_id + f'.{self.img_suffix}'
+        data_info['file_name'] = img_name
+        
+        img_path = txt_file.replace('.txt','.png').replace('labelTxt','images')
+        data_info['img_path'] = img_path
+        
+        instances = []
+        with open(txt_file) as f:
+            s = f.readlines()
+            for si in s:
+                instance = {}
+                bbox_info = si.split()
+                instance['bbox_label'] = 0                       
+                instance['ignore_flag'] = 0
+                instance['bbox'] = [float(i) for i in bbox_info[:8]]
+                instances.append(instance)
+        data_info['instances'] = instances
+        return data_info
+                
+    def __getitem__(self, idx):
+        data_info = self.load_data_info(idx)
+        bboxes = []
+        if len(self.transform.transforms):       
+            data = self.transform(data_info)
+            image = data['inputs'].cpu().numpy().transpose(1, 2, 0)
+            box = data['data_samples'].gt_instances.bboxes.tensor
+            for box_id in range(box.shape[0]):
+                instances = box[box_id]
+                bboxes.append(np.array([(instances[i], instances[i + 1]) for i in range(0, len(instances), 2)], dtype=np.int32)) 
+            del data
+        else:
+            image = cv2.cvtColor(cv2.imread(data_info['img_path']), cv2.COLOR_BGR2RGB)
+            for instances in data_info['instances']:
+               bboxes.append(np.array([(instances['bbox'][i], instances['bbox'][i + 1]) for i in range(0, len(instances['bbox']), 2)], dtype=np.int32)) 
+        keypoints, descriptors, image = extract_img_feature(self.descriptor, image, self.extractor)    
+        if len(keypoints) <= 0:
+            print(f">>> {data_info['img_path']} has no keypoint founded with {self.descriptor}")
+            return torch.zeros([2, self.config['keypoint_dim'] + self.config['descriptor_dim'] + 2], dtype = torch.float32, requires_grad = False), data_info['img_path']
+        else:     
+            tmp = np.zeros(image.shape[:2], dtype=np.uint8)
+            if len(bboxes) > 0 :
+                cv2.fillPoly(tmp, bboxes, 1)
+            target = np.array([np.any(tmp[max(0,int(kp[1]-self.expand_piexl)):min(int(kp[1]+self.expand_piexl),image.shape[0]),
+                                        max(0,int(kp[0]-self.expand_piexl)):min(int(kp[0]+self.expand_piexl),image.shape[1])]) 
+                            for kp in keypoints ]) 
+            # visualization
+            if self.debug:
+                print(f">>> VISUALIZATION: {data_info['img_path']}")
+                kps = np.array([cv2.KeyPoint(*kp) for kp in keypoints])
+                image = cv2.drawKeypoints(image, kps[target], None, color=(255,0,0,)) 
+                image = cv2.drawKeypoints(image, kps[~target], None, color=(0,0,255)) 
+                image = cv2.polylines(image, bboxes, isClosed=True, color=(0, 255, 0), thickness=2)
+                cv2.imwrite('test_2.jpg', cv2.cvtColor(image, cv2.COLOR_RGB2BGR)) 
+
+            # boosted the descriptor using trained model
+            keypoints = normalize_keypoints(keypoints, image.shape).astype(np.float32)
+            if 'orb' in self.descriptor.lower():
+                descriptors = np.unpackbits(descriptors, axis=1, bitorder='little').astype(np.float32)
+                descriptors = descriptors * 2.0 - 1.0
+            # 最后的全一是为了区分对齐batch的padding数据              
+            result = torch.from_numpy(np.concatenate([keypoints, descriptors, target.reshape(-1, 1), np.ones([len(target),1])], axis=-1))  
+            result.requires_grad = False                 
+            return result, data_info['img_path']
+
+def get_metric(all_labels, all_output, all_thred):
+    
+    if isinstance(all_output, torch.Tensor):
+        if all_output.requires_grad:
+            all_output = all_output.detach()
+        all_output = all_output.cpu().numpy()    
+    if isinstance(all_labels, torch.Tensor):
+        all_labels = all_labels.cpu().numpy()
+    if isinstance(all_thred, torch.Tensor):
+        all_thred = all_thred.cpu().numpy()
+        
+    all_predict = (all_output>all_thred) 
+    all_labels = all_labels   
+    all_output = all_output        
+    accuracy = accuracy_score(all_labels, all_predict)
+    precision = precision_score(all_labels, all_predict)
+    recall = recall_score(all_labels, all_predict)
+    F1_score = f1_score(all_labels, all_predict)
+    AP_score = average_precision_score(all_labels, all_output)
+    metric_dict = dict(Accuracy=accuracy, Precision=precision, Recall=recall, F1_score=F1_score, Average_Precision = AP_score)
+    metric_str = "Accuracy: {Accuracy:.2f}、Precision: {Precision:.2f}、Recall: {Recall:.2f}、F1-score: {F1_score:.2f}、Average_Precision: {Average_Precision:.2f}".format(**metric_dict)
+    print(metric_str)
+    precisions, recalls, _ = precision_recall_curve(all_labels, all_output)
+    PR_dict = dict(Precision=precisions, Recall=recalls)
+    return metric_dict, PR_dict
+
+def test(model, args): 
+    model.eval()
+    device = model.device
+    extractor = extractor_build(args.descriptor)
+    keypoints, descriptors, image = extract_img_feature(args.descriptor, cv2.cvtColor(cv2.imread(args.test_image), cv2.COLOR_BGR2RGB), extractor)
+            
+    boxes = []
+    with open(args.test_image.replace('.png','.txt').replace('images','labelTxt'), 'r') as file:
+        for line in file:
+            coordinates = [float(coord) for coord in line.strip().split()[:8]]
+            boxes.append(np.array([(coordinates[i], coordinates[i + 1]) for i in range(0, len(coordinates), 2)], dtype=np.int32))
+    tmp = np.zeros(image.shape[:2], dtype=np.uint8)
+    if len(boxes) > 0 :
+        cv2.fillPoly(tmp, boxes, 1) 
+    labels = np.array([np.any(tmp[max(0,int(kp[1]-args.expand_piexl)):min(int(kp[1]+args.expand_piexl),image.shape[0]),
+                                max(0,int(kp[0]-args.expand_piexl)):min(int(kp[0]+args.expand_piexl),image.shape[1])]) 
+                    for kp in keypoints ]) 
+    
+    kps = np.array([cv2.KeyPoint(*kp) for kp in keypoints])
+
+    # boosted the descriptor using trained model
+    keypoints = normalize_keypoints(keypoints, image.shape).astype(np.float32)
+    if 'orb' in args.descriptor.lower():
+        descriptors = np.unpackbits(descriptors, axis=1, bitorder='little').astype(np.float32)
+        descriptors = descriptors * 2.0 - 1.0
+    with torch.no_grad():                  
+        output = model(torch.from_numpy(np.concatenate([keypoints, descriptors,], axis=-1)).to(device).float()).cpu().numpy()  
+    if args.test_threshold is None:
+        threshold, _  = cv2.threshold((output * 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)  
+        threshold = min(threshold/255.0 * args.test_threshold_mul, 0.95) 
+        print(f"Threshold is drived from OTSU algorithm :{threshold}.")   
+    else:
+        print(f"Threshold is a constant value {args.test_threshold}.") 
+        threshold = args.test_threshold
+    predict = (output > threshold)
+
+    metric_dict, PR_dict = get_metric(labels, output, threshold)
+    
+    image = cv2.drawKeypoints(image, kps[predict], None, color=(0, 255, 0),) # 红色 虚警 
+    # image = cv2.drawKeypoints(image, kps[(~predict)&(labels)], None, color=(0,0,255)) # Aqua蓝色 漏检 
+    # image = cv2.drawKeypoints(image, kps[predict&labels], None, color=(0,0,255,),) # 黄色 正确预测(正样本)
+    # image = cv2.drawKeypoints(image, kps[(~predict)&(~labels)], None, color= (0, 255, 0) ) # 绿色 正确预测(负样本)
+    # image = cv2.drawKeypoints(image, kps[(label)], None, color=(255,0,0,))
+    # image = cv2.drawKeypoints(image, kps[(~label)], None, color=(0,0,255))
+    image = cv2.polylines(image, boxes, isClosed=True, color=(255, 255, 0), thickness=2)
+    cv2.imwrite('test.jpg', cv2.cvtColor(image, cv2.COLOR_RGB2BGR))  
+    return metric_dict, PR_dict
+
+def evaluate(model, data_root, ann_file, args):
+    model.eval() 
+    device = model.device
+    eva_dataset = ShipKeyPointsDataset(data_root, args.descriptor, expand_piexl = args.expand_piexl, ann_file = ann_file, device = device)
+    eva_loader = DataLoader(eva_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=custom_collate_fn,pin_memory=True,multiprocessing_context=args.multiprocessing_context)
+
+    all_output = torch.tensor([], device=device)
+    all_labels = torch.tensor([], device=device)
+    all_thred = torch.tensor([], device=device)     
+    if args.test_threshold is None:
+        print(f"Threshold is drived from OTSU algorithm.")
+    else:
+        print(f"Threshold is a constant value {args.test_threshold}.") 
+        all_thred = args.test_threshold
+    
+    with torch.no_grad():
+        for i, (data, img_paths) in enumerate(eva_loader):
+            data = data.to(device).float()  # 将测试数据移动到GPU
+            outputs = model(data[:,:,:-2])
+            
+            if args.test_threshold is None:
+                for k in range(outputs.shape[0]):
+                    thred, _  = cv2.threshold((outputs[k] * 255).cpu().numpy().astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    all_thred = torch.cat([all_thred, torch.tensor([min(thred/255.0 * args.test_threshold_mul, 0.95)]*(int(data[k,:,-1].sum())), device=device) ])            
+                    
+            all_output = torch.cat([all_output, outputs[data[:,:,-1].bool()]])    
+            all_labels = torch.cat([all_labels, data[:,:,-2].bool()[data[:,:,-1].bool()]]) 
+
+            if (i + 1) % args.print_interval == 0:
+                print(f"{time.strftime('%m/%d %H:%M:%S')} - Epoch(test) : [{i + 1}/{len(eva_loader)}]")
+
+    return get_metric(all_labels, all_output, all_thred)
+ 
+
+def train(model, args):
+    device = model.device
+    
+    train_pipeline = [
+        dict(type='mmdet.LoadImageFromFile', backend_args=None),
+        dict(type='mmdet.LoadAnnotations', with_bbox=True, box_type='qbox'),
+        dict(
+            type='mmrotate.ConvertBoxType',
+            box_type_mapping=dict(gt_bboxes='rbox')),
+        dict(type='mmdet.RandomCrop', crop_size=(800,800)),
+        dict(
+            type='mmrotate.RandomRotate',
+            prob=0.5,
+            angle_range=180,
+            rotate_type='mmrotate.Rotate'),
+        dict(
+            type='mmdet.RandomFlip',
+            prob=0.75,
+            direction=['horizontal', 'vertical', 'diagonal']),
+        dict(
+            type='mmdet.RandomAffine',),    
+        dict(
+            type='mmdet.PhotoMetricDistortion',),    
+
+        dict(
+            type='mmrotate.ConvertBoxType',
+            box_type_mapping=dict(gt_bboxes='qbox')),
+        dict(type='mmdet.PackDetInputs', meta_keys=())]
+    train_pipeline = [] 
+    train_dataset = ShipKeyPointsDataset("data/hrsid/", args.descriptor, expand_piexl = args.expand_piexl, ann_file = ['trainsplit/','valplit/'], pipeline = train_pipeline, device = device, train_ratio = args.train_ratio)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=custom_collate_fn, worker_init_fn=worker_init_fn,pin_memory=True,multiprocessing_context=args.multiprocessing_context)
+    
+    outputs = get_model_complexity_info(
+        model,
+        input_shape=None,
+        inputs=train_dataset.__getitem__(0)[0][:,:-2].float().to(device),  # the input tensor of the model
+        show_table=True,  # show the complexity table
+        show_arch=False)  # show the complexity arch
+    for k, v in outputs.items():
+        print(f"{k}: {v}")
+    
+    # 定义损失函数和优化器
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    total_steps = len(train_loader) * args.num_epochs
+    scheduler = ChainedScheduler([LinearLR(optimizer, start_factor=1.0 / 20, end_factor=1.0, total_iters=args.warmup_step, last_epoch=-1, verbose=False),
+                                CosineAnnealingWarmRestarts(optimizer, T_0 = (total_steps - args.warmup_step)//8, T_mult=1, eta_min=5e-7, verbose=False)])
+    
+    start_epoch = 0
+    best_AP = 0.0
+    if len(args.checkpoint):
+        checkpoint = torch.load(args.checkpoint)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict']),
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch']+1
+        best_AP = checkpoint['best_AP']
+        print(f'>>> Continue training from epoch [{start_epoch}] !')
+    
+    for epoch in range(start_epoch, args.num_epochs):       
+        start_time = time.time()
+        model.train()
+        for i, (data, img_paths)  in enumerate(train_loader):
+            optimizer.zero_grad()
+            data = data.to(device).float()
+            outputs = model(data[:,:,:-2])
+            vaild = data[:,:,-1].reshape(-1).bool()
+            loss = criterion(outputs.reshape(-1)[vaild], data[:,:,-2].reshape(-1)[vaild])
+            loss.backward()
+
+            clip_grad_norm_(model.parameters(), 35, 2)
+            optimizer.step()
+            scheduler.step()
+            if (i + 1) % args.print_interval == 0:
+                current_time = time.time()
+                eta_seconds = (current_time - start_time) / (i+1) * ( (args.num_epochs - epoch ) * len(train_loader) - (i + 1))
+                eta_str = str(int(eta_seconds // 3600)) + ':' + str(int((eta_seconds % 3600) // 60)) + ':' + str(int(eta_seconds % 60))
+                print(f"{time.strftime('%m/%d %H:%M:%S')} - Epoch(train)  [{epoch + 1}/{args.num_epochs}][{i + 1}/{len(train_loader)}]  lr: {optimizer.param_groups[0]['lr']:.4e}  eta: {eta_str}  time: {current_time - start_time:.4f}   loss: {loss:.4f}")
+            
+        if ((epoch+1) % args.eval_interval == 0) or (epoch == 0) or (epoch == args.num_epochs-1):
+            print(f"\n{time.strftime('%m/%d %H:%M:%S')} - Epoch(test) - all: [{epoch+1}/{args.num_epochs}]:") 
+            metric_dict_all, _ = evaluate(model, "data/hrsid/", ['testsplit/all/'], args)
+            
+            # print(f"\n{time.strftime('%m/%d %H:%M:%S')} - Epoch(test) - offshore: [{epoch+1}/{args.num_epochs}]:")  
+            # metric_dict, _ = evaluate(model, "data/hrsid/", ['testsplit/offshore/'], args)
+              
+            print(f"\n{time.strftime('%m/%d %H:%M:%S')} - Epoch(test) - inshore: [{epoch+1}/{args.num_epochs}]:") 
+            _, _ = evaluate(model, "data/hrsid/", ['testsplit/inshore/'], args)
+            
+            # 检查是否有更好的模型，如果有，则保存权重
+            if metric_dict_all['Average_Precision'] > best_AP:
+                best_AP = metric_dict_all['Average_Precision']
+                # 保存当前模型的权重
+                torch.save(model.state_dict(), args.save_path)
+                print(f"{time.strftime('%m/%d %H:%M:%S')} - Best model achieved at epoch {epoch + 1}, with all test image AP {best_AP:.4f}")
+            if (epoch >= args.num_epochs-1):
+                last_save_path = 'work_dirs/' + args.descriptor + '_last_model_weight.pth'
+                torch.save(model.state_dict(), last_save_path)
+                print(f"{time.strftime('%m/%d %H:%M:%S')} - Last model saved :{last_save_path}") 
+
+        if ((epoch+1) % args.save_interval == 0):
+            for file_path in glob.glob(args.save_path[:-4] + '*_epoch.pth'):
+                os.remove(file_path)
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'epoch': epoch,
+                'best_AP': best_AP,
+                }, args.save_path[:-4] + f'_{epoch+1}_epoch.pth') 
+    
+def worker_init_fn(worker_id):
+    # torch.cuda.set_device(worker_id) 指定数加载设备
+    torch.cuda.manual_seed_all(worker_id)   
+
+def custom_collate_fn(batch):
+    results = [item[0] for item in batch]  # 提取每个样本的result
+    img_paths = [item[1] for item in batch]  # 提取每个样本的img_path
+    padded_results = pad_sequence(results, batch_first=True, padding_value=0)
+    return padded_results, img_paths
+    
+if __name__ == '__main__': 
+
+    args = parse_arguments()
+
+    random.seed(args.random_seed)
+    np.random.seed(args.random_seed)
+    torch.manual_seed(args.random_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.random_seed)  
+
+    if ('alike' in args.descriptor.lower()) or ('superpoint' in args.descriptor.lower()) or ('hardnet' in args.descriptor.lower()) or ('sosnet' in args.descriptor.lower()):
+        args.multiprocessing_context = 'spawn'
+        
+    pretrained = '' # Path(__file__).parent / str("FeatureBooster/models/" + args.descriptor + ".pth")
+    pretrained_str = 'finetune' if os.path.isfile(pretrained) else 'scratch'
+    args.save_path = args.save_path if len(args.save_path) else 'work_dirs/' + args.descriptor + f'{args.train_ratio*100:.0f}_' + f'_best_model_weights_{pretrained_str}.pth'
+    
+    print(args)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
+    print(f">>> device: {device}!")          
+    model = ShipKeyPointsModel(args.descriptor, device=device, pretrained = pretrained)
+
+    if not args.test:
+        with open(__file__, 'r') as file:
+            lines = file.readlines() 
+        for line in lines:
+            print(line[:-1])
+        print('\n')   
+        train(model, args)
+        
+    model.load_state_dict(torch.load(args.save_path), strict=False)
+    model_weights_md5 = calculate_md5(args.save_path)
+    print(f">>> model weights loaded from {args.save_path} with MD5 {model_weights_md5}!")
+
+    if not len(args.test_image):        
+        print(f"\n{time.strftime('%m/%d %H:%M:%S')} - Epoch(test) - all:") 
+        metric_dict, PR_dict_all = evaluate(model, "data/hrsid/", ['testsplit/all/'], args)
+            
+        print(f"\n{time.strftime('%m/%d %H:%M:%S')} - Epoch(test) - offshore:")  
+        metric_dict, PR_dict_offshore = evaluate(model, "data/hrsid/", ['testsplit/offshore/'], args)
+            
+        print(f"\n{time.strftime('%m/%d %H:%M:%S')} - Epoch(test) - inshore:") 
+        metric_dict, PR_dict_inshore = evaluate(model, "data/hrsid/", ['testsplit/inshore/'], args)
+
+        plt.figure()
+        plt.plot(PR_dict_all['Recall'], PR_dict_all['Precision'], label='PR curve for all')
+        plt.plot(PR_dict_offshore['Recall'], PR_dict_offshore['Precision'], label='PR curve for offshore')
+        plt.plot(PR_dict_inshore['Recall'], PR_dict_inshore['Precision'], label='PR curve for inshore')
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        # plt.title('Precision-Recall Curve')
+        plt.legend()
+        PR_curve_path = 'work_dirs/' + f'PR_curve_{args.save_path.split("/")[-1][:-4]}_{model_weights_md5[:5]}.png'
+        plt.savefig(PR_curve_path, bbox_inches='tight', dpi=300)  
+        print(f">>> PR_cruve saved: {PR_curve_path}")
+        
+        shutil.copy(args.save_path,'/keypoint_results/')
+        shutil.copy(PR_curve_path,'/keypoint_results/')
+    else:
+        print(f"\n{time.strftime('%m/%d %H:%M:%S')} - Epoch(test) - {args.test_image}:")            
+        metric_dict, PR_dict = test(model, args
+
+
+11/08 03:21:38 - mmengine - WARNING - Unsupported operator aten::add encountered 2 time(s)
+11/08 03:21:38 - mmengine - WARNING - Unsupported operator aten::sigmoid encountered 4 time(s)
+11/08 03:21:38 - mmengine - WARNING - Unsupported operator aten::softmax encountered 3 time(s)
+11/08 03:21:38 - mmengine - WARNING - Unsupported operator aten::mul encountered 7 time(s)
+11/08 03:21:38 - mmengine - WARNING - Unsupported operator aten::sum encountered 3 time(s)
+11/08 03:21:38 - mmengine - WARNING - Unsupported operator aten::add_ encountered 6 time(s)
+11/08 03:21:38 - mmengine - WARNING - Unsupported operator aten::tanh encountered 1 time(s)
+11/08 03:21:38 - mmengine - WARNING - Unsupported operator aten::mean encountered 1 time(s)
+11/08 03:21:38 - mmengine - WARNING - Unsupported operator aten::sub encountered 1 time(s)
+11/08 03:21:38 - mmengine - WARNING - The following submodules of the model were never called during the trace of the graph. They may be unused, or they were accessed by direct calls to .forward() or via other python methods. In the latter case they will have zeros for statistics, though their statistics will still contribute to their parent calling module.
+feature_booster.attn_proj.layers.0.attn.dropout, feature_booster.attn_proj.layers.0.ffn.dropout, feature_booster.attn_proj.layers.1.attn.dropout, feature_booster.attn_proj.layers.1.ffn.dropout, feature_booster.attn_proj.layers.2.attn.dropout, feature_booster.attn_proj.layers.2.ffn.dropout, feature_booster.denc.dropout, feature_booster.dropout, feature_booster.kenc.dropout
+11/08 03:21:38 - mmengine - WARNING - Unsupported operator aten::layer_norm encountered 7 time(s)
+flops: 31800960
+flops_str: 31.801M
+activations: 116369
+activations_str: 0.116M
+params: 2020419
+params_str: 2.02M
+out_table: 
++---------------------------+----------------------+------------+--------------+
+| module                    | #parameters or shape | #flops     | #activations |
++---------------------------+----------------------+------------+--------------+
+| model                     | 2.02M                | 31.801M    | 0.116M       |
+|  k                        |  ()                  |            |              |
+|  feature_booster          |  1.954M              |  31.242M   |  0.114M      |
+|   feature_booster.kenc.e… |   0.109M             |   1.738M   |   11.776K    |
+|    feature_booster.kenc.… |    0.128K            |    1.536K  |    0.512K    |
+|    feature_booster.kenc.… |    2.112K            |    32.768K |    1.024K    |
+|    feature_booster.kenc.… |    8.32K             |    0.131M  |    2.048K    |
+|    feature_booster.kenc.… |    33.024K           |    0.524M  |    4.096K    |
+|    feature_booster.kenc.… |    65.792K           |    1.049M  |    4.096K    |
+|   feature_booster.denc.e… |   0.197M             |   3.146M   |   12.288K    |
+|    feature_booster.denc.… |    65.792K           |    1.049M  |    4.096K    |
+|    feature_booster.denc.… |    65.792K           |    1.049M  |    4.096K    |
+|    feature_booster.denc.… |    65.792K           |    1.049M  |    4.096K    |
+|   feature_booster.attn_p… |   1.581M             |   25.289M  |   86.016K    |
+|    feature_booster.attn_… |    0.527M            |    8.43M   |    28.672K   |
+|    feature_booster.attn_… |    0.527M            |    8.43M   |    28.672K   |
+|    feature_booster.attn_… |    0.527M            |    8.43M   |    28.672K   |
+|   feature_booster.final_… |   65.792K            |   1.049M   |   4.096K     |
+|    feature_booster.final… |    (256, 256)        |            |              |
+|    feature_booster.final… |    (256,)            |            |              |
+|   feature_booster.layer_… |   0.512K             |   20.48K   |   0          |
+|    feature_booster.layer… |    (256,)            |            |              |
+|    feature_booster.layer… |    (256,)            |            |              |
+|  fc_out                   |  33.025K             |  0.526M    |  2.064K      |
+|   fc_out.0                |   32.896K            |   0.524M   |   2.048K     |
+|    fc_out.0.weight        |    (128, 256)        |            |              |
+|    fc_out.0.bias          |    (128,)            |            |              |
+|   fc_out.2                |   0.129K             |   2.048K   |   16         |
+|    fc_out.2.weight        |    (1, 128)          |            |              |
+|    fc_out.2.bias          |    (1,)              |            |              |
+|  fc_thed                  |  33.025K             |  32.896K   |  0.129K      |
+|   fc_thed.0               |   32.896K            |   32.768K  |   0.128K     |
+|    fc_thed.0.weight       |    (128, 256)        |            |              |
+|    fc_thed.0.bias         |    (128,)            |            |              |
+|   fc_thed.2               |   0.129K             |   0.128K   |   1          |
+|    fc_thed.2.weight       |    (1, 128)          |            |              |
+|    fc_thed.2.bias         |    (1,)              |            |              |
++---------------------------+----------------------+------------+--------------+
+
+out_arch: 
+11/08 03:22:04 - Epoch(train)  [1/100][5/29]  lr: 9.9952e-04  eta: 4:8:49  time: 25.7848   loss: 0.4504
+11/08 03:22:11 - Epoch(train)  [1/100][10/29]  lr: 9.9810e-04  eta: 2:36:57  time: 32.5879   loss: 0.5004
+11/08 03:22:17 - Epoch(train)  [1/100][15/29]  lr: 9.9572e-04  eta: 2:4:57  time: 38.9796   loss: 0.2797
+11/08 03:22:24 - Epoch(train)  [1/100][20/29]  lr: 9.9241e-04  eta: 1:50:22  time: 45.9923   loss: 0.2240
+11/08 03:22:37 - Epoch(train)  [1/100][25/29]  lr: 9.8815e-04  eta: 1:51:45  time: 58.3074   loss: 0.2520
+
+11/08 03:22:41 - Epoch(test) - all: [1/100]:
+Threshold is drived from OTSU algorithm.
+11/08 03:23:12 - Epoch(test) : [5/16]
+11/08 03:23:19 - Epoch(test) : [10/16]
+11/08 03:23:25 - Epoch(test) : [15/16]
+Accuracy: 0.85、Precision: 0.56、Recall: 0.85、F1-score: 0.67、Average_Precision: 0.82
+
+11/08 03:23:27 - Epoch(test) - inshore: [1/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.80、Precision: 0.34、Recall: 0.77、F1-score: 0.48、Average_Precision: 0.51
+11/08 03:23:43 - Best model achieved at epoch 1, with all test image AP 0.8169
+11/08 03:24:11 - Epoch(train)  [2/100][5/29]  lr: 9.7816e-04  eta: 4:31:35  time: 28.4289   loss: 0.2071
+11/08 03:24:18 - Epoch(train)  [2/100][10/29]  lr: 9.7134e-04  eta: 2:45:56  time: 34.8009   loss: 0.2124
+11/08 03:24:24 - Epoch(train)  [2/100][15/29]  lr: 9.6361e-04  eta: 2:11:24  time: 41.4107   loss: 0.2177
+11/08 03:24:31 - Epoch(train)  [2/100][20/29]  lr: 9.5500e-04  eta: 1:53:49  time: 47.9094   loss: 0.3005
+11/08 03:24:42 - Epoch(train)  [2/100][25/29]  lr: 9.4553e-04  eta: 1:52:52  time: 59.4953   loss: 0.2132
+11/08 03:25:14 - Epoch(train)  [3/100][5/29]  lr: 9.2636e-04  eta: 4:26:50  time: 28.2176   loss: 0.1989
+11/08 03:25:21 - Epoch(train)  [3/100][10/29]  lr: 9.1456e-04  eta: 2:45:53  time: 35.1450   loss: 0.1857
+11/08 03:25:28 - Epoch(train)  [3/100][15/29]  lr: 9.0198e-04  eta: 2:11:50  time: 41.9743   loss: 0.1581
+11/08 03:25:34 - Epoch(train)  [3/100][20/29]  lr: 8.8863e-04  eta: 1:53:57  time: 48.4587   loss: 0.1603
+11/08 03:25:44 - Epoch(train)  [3/100][25/29]  lr: 8.7454e-04  eta: 1:49:51  time: 58.4995   loss: 0.2099
+11/08 03:26:17 - Epoch(train)  [4/100][5/29]  lr: 8.4741e-04  eta: 4:30:40  time: 28.9178   loss: 0.1499
+11/08 03:26:24 - Epoch(train)  [4/100][10/29]  lr: 8.3139e-04  eta: 2:47:16  time: 35.8077   loss: 0.1650
+11/08 03:26:30 - Epoch(train)  [4/100][15/29]  lr: 8.1475e-04  eta: 2:10:1  time: 41.8244   loss: 0.2193
+11/08 03:26:37 - Epoch(train)  [4/100][20/29]  lr: 7.9751e-04  eta: 1:53:29  time: 48.7622   loss: 0.1655
+11/08 03:26:48 - Epoch(train)  [4/100][25/29]  lr: 7.7971e-04  eta: 1:50:46  time: 59.5957   loss: 0.1413
+11/08 03:27:22 - Epoch(train)  [5/100][5/29]  lr: 7.4634e-04  eta: 4:27:17  time: 28.8556   loss: 0.1565
+11/08 03:27:28 - Epoch(train)  [5/100][10/29]  lr: 7.2713e-04  eta: 2:43:20  time: 35.3292   loss: 0.1335
+11/08 03:27:35 - Epoch(train)  [5/100][15/29]  lr: 7.0749e-04  eta: 2:8:40  time: 41.8240   loss: 0.1478
+11/08 03:27:41 - Epoch(train)  [5/100][20/29]  lr: 6.8746e-04  eta: 1:51:42  time: 48.5019   loss: 0.1970
+11/08 03:27:53 - Epoch(train)  [5/100][25/29]  lr: 6.6707e-04  eta: 1:50:49  time: 60.2493   loss: 0.1283
+
+11/08 03:27:57 - Epoch(test) - all: [5/100]:
+Threshold is drived from OTSU algorithm.
+11/08 03:28:26 - Epoch(test) : [5/16]
+11/08 03:28:33 - Epoch(test) : [10/16]
+11/08 03:28:39 - Epoch(test) : [15/16]
+Accuracy: 0.91、Precision: 0.68、Recall: 0.89、F1-score: 0.77、Average_Precision: 0.89
+
+11/08 03:28:41 - Epoch(test) - inshore: [5/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.88、Precision: 0.51、Recall: 0.82、F1-score: 0.63、Average_Precision: 0.67
+11/08 03:28:57 - Best model achieved at epoch 5, with all test image AP 0.8940
+11/08 03:29:24 - Epoch(train)  [6/100][5/29]  lr: 6.2959e-04  eta: 4:9:20  time: 27.2010   loss: 0.1193
+11/08 03:29:30 - Epoch(train)  [6/100][10/29]  lr: 6.0842e-04  eta: 2:34:42  time: 33.8149   loss: 0.1681
+11/08 03:29:37 - Epoch(train)  [6/100][15/29]  lr: 5.8703e-04  eta: 2:1:44  time: 39.9906   loss: 0.1320
+11/08 03:29:44 - Epoch(train)  [6/100][20/29]  lr: 5.6548e-04  eta: 1:47:2  time: 46.9635   loss: 0.1609
+11/08 03:29:56 - Epoch(train)  [6/100][25/29]  lr: 5.4381e-04  eta: 1:47:32  time: 59.0844   loss: 0.1413
+11/08 03:30:30 - Epoch(train)  [7/100][5/29]  lr: 5.0461e-04  eta: 4:44:15  time: 31.3399   loss: 0.1239
+11/08 03:30:37 - Epoch(train)  [7/100][10/29]  lr: 4.8281e-04  eta: 2:50:6  time: 37.5807   loss: 0.1900
+11/08 03:30:44 - Epoch(train)  [7/100][15/29]  lr: 4.6104e-04  eta: 2:15:24  time: 44.9523   loss: 0.1015
+11/08 03:30:51 - Epoch(train)  [7/100][20/29]  lr: 4.3935e-04  eta: 1:56:27  time: 51.6431   loss: 0.1113
+11/08 03:31:01 - Epoch(train)  [7/100][25/29]  lr: 4.1777e-04  eta: 1:51:14  time: 61.7775   loss: 0.1302
+11/08 03:31:36 - Epoch(train)  [8/100][5/29]  lr: 3.7935e-04  eta: 4:31:8  time: 30.2166   loss: 0.0971
+11/08 03:31:42 - Epoch(train)  [8/100][10/29]  lr: 3.5831e-04  eta: 2:43:57  time: 36.6129   loss: 0.1195
+11/08 03:31:48 - Epoch(train)  [8/100][15/29]  lr: 3.3755e-04  eta: 2:6:33  time: 42.4700   loss: 0.0814
+11/08 03:31:55 - Epoch(train)  [8/100][20/29]  lr: 3.1709e-04  eta: 1:49:48  time: 49.2244   loss: 0.1131
+11/08 03:32:07 - Epoch(train)  [8/100][25/29]  lr: 2.9698e-04  eta: 1:48:56  time: 61.1561   loss: 0.1217
+11/08 03:32:41 - Epoch(train)  [9/100][5/29]  lr: 2.6179e-04  eta: 4:28:45  time: 30.2764   loss: 0.1508
+11/08 03:32:47 - Epoch(train)  [9/100][10/29]  lr: 2.4286e-04  eta: 2:43:9  time: 36.8301   loss: 0.1155
+11/08 03:32:53 - Epoch(train)  [9/100][15/29]  lr: 2.2442e-04  eta: 2:5:35  time: 42.6028   loss: 0.0968
+11/08 03:33:00 - Epoch(train)  [9/100][20/29]  lr: 2.0650e-04  eta: 1:49:17  time: 49.5281   loss: 0.1346
+11/08 03:33:12 - Epoch(train)  [9/100][25/29]  lr: 1.8915e-04  eta: 1:48:39  time: 61.6723   loss: 0.1093
+11/08 03:33:47 - Epoch(train)  [10/100][5/29]  lr: 1.5942e-04  eta: 4:25:57  time: 30.2922   loss: 0.1547
+11/08 03:33:52 - Epoch(train)  [10/100][10/29]  lr: 1.4380e-04  eta: 2:37:59  time: 36.0564   loss: 0.1166
+11/08 03:33:59 - Epoch(train)  [10/100][15/29]  lr: 1.2886e-04  eta: 2:4:37  time: 42.7447   loss: 0.1306
+11/08 03:34:06 - Epoch(train)  [10/100][20/29]  lr: 1.1463e-04  eta: 1:48:8  time: 49.5524   loss: 0.1196
+11/08 03:34:21 - Epoch(train)  [10/100][25/29]  lr: 1.0113e-04  eta: 1:52:34  time: 64.5949   loss: 0.1390
+
+11/08 03:34:27 - Epoch(test) - all: [10/100]:
+Threshold is drived from OTSU algorithm.
+11/08 03:37:10 - Epoch(test) : [5/16]
+11/08 03:37:17 - Epoch(test) : [10/16]
+11/08 03:37:24 - Epoch(test) : [15/16]
+Accuracy: 0.92、Precision: 0.74、Recall: 0.90、F1-score: 0.81、Average_Precision: 0.92
+
+11/08 03:37:26 - Epoch(test) - inshore: [10/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.91、Precision: 0.59、Recall: 0.83、F1-score: 0.69、Average_Precision: 0.75
+11/08 03:37:42 - Best model achieved at epoch 10, with all test image AP 0.9165
+11/08 03:38:11 - Epoch(train)  [11/100][5/29]  lr: 7.8765e-05  eta: 4:8:14  time: 28.5883   loss: 0.0811
+11/08 03:38:18 - Epoch(train)  [11/100][10/29]  lr: 6.7454e-05  eta: 2:34:9  time: 35.5731   loss: 0.1203
+11/08 03:38:26 - Epoch(train)  [11/100][15/29]  lr: 5.6966e-05  eta: 2:3:11  time: 42.7226   loss: 0.0811
+11/08 03:38:32 - Epoch(train)  [11/100][20/29]  lr: 4.7323e-05  eta: 1:46:37  time: 49.4038   loss: 0.1152
+11/08 03:38:44 - Epoch(train)  [11/100][25/29]  lr: 3.8541e-05  eta: 1:45:6  time: 60.9883   loss: 0.0916
+11/08 03:39:14 - Epoch(train)  [12/100][5/29]  lr: 2.4960e-05  eta: 3:54:54  time: 27.3571   loss: 0.0997
+11/08 03:39:21 - Epoch(train)  [12/100][10/29]  lr: 1.8676e-05  eta: 2:26:27  time: 34.1783   loss: 0.1123
+11/08 03:39:27 - Epoch(train)  [12/100][15/29]  lr: 1.3309e-05  eta: 1:54:8  time: 40.0366   loss: 0.1390
+11/08 03:39:34 - Epoch(train)  [12/100][20/29]  lr: 8.8684e-06  eta: 1:40:4  time: 46.8898   loss: 0.1461
+11/08 03:39:46 - Epoch(train)  [12/100][25/29]  lr: 5.3635e-06  eta: 1:39:44  time: 58.5298   loss: 0.1054
+11/08 03:40:16 - Epoch(train)  [13/100][5/29]  lr: 1.4321e-06  eta: 3:51:58  time: 27.3239   loss: 0.0788
+11/08 03:40:23 - Epoch(train)  [13/100][10/29]  lr: 5.7611e-07  eta: 2:25:13  time: 34.2764   loss: 0.0834
+11/08 03:40:29 - Epoch(train)  [13/100][15/29]  lr: 9.9983e-04  eta: 1:54:25  time: 40.5912   loss: 0.1069
+11/08 03:40:36 - Epoch(train)  [13/100][20/29]  lr: 9.9878e-04  eta: 1:39:38  time: 47.2201   loss: 0.1399
+11/08 03:40:47 - Epoch(train)  [13/100][25/29]  lr: 9.9679e-04  eta: 1:37:56  time: 58.1323   loss: 0.1481
+11/08 03:41:17 - Epoch(train)  [14/100][5/29]  lr: 9.9082e-04  eta: 3:48:49  time: 27.2624   loss: 0.1037
+11/08 03:41:23 - Epoch(train)  [14/100][10/29]  lr: 9.8619e-04  eta: 2:19:20  time: 33.2680   loss: 0.1191
+11/08 03:41:30 - Epoch(train)  [14/100][15/29]  lr: 9.8064e-04  eta: 1:51:15  time: 39.9230   loss: 0.1832
+11/08 03:41:37 - Epoch(train)  [14/100][20/29]  lr: 9.7417e-04  eta: 1:37:32  time: 46.7672   loss: 0.1199
+11/08 03:41:48 - Epoch(train)  [14/100][25/29]  lr: 9.6681e-04  eta: 1:36:33  time: 57.9790   loss: 0.1339
+11/08 03:42:21 - Epoch(train)  [15/100][5/29]  lr: 9.5132e-04  eta: 3:57:13  time: 28.5918   loss: 0.1202
+11/08 03:42:27 - Epoch(train)  [15/100][10/29]  lr: 9.4150e-04  eta: 2:24:29  time: 34.9028   loss: 0.1018
+11/08 03:42:33 - Epoch(train)  [15/100][15/29]  lr: 9.3085e-04  eta: 1:54:11  time: 41.4570   loss: 0.1145
+11/08 03:42:40 - Epoch(train)  [15/100][20/29]  lr: 9.1938e-04  eta: 1:39:12  time: 48.1239   loss: 0.1159
+11/08 03:42:52 - Epoch(train)  [15/100][25/29]  lr: 9.0710e-04  eta: 1:38:33  time: 59.8800   loss: 0.1128
+
+11/08 03:42:55 - Epoch(test) - all: [15/100]:
+Threshold is drived from OTSU algorithm.
+11/08 03:43:23 - Epoch(test) : [5/16]
+11/08 03:43:30 - Epoch(test) : [10/16]
+11/08 03:43:36 - Epoch(test) : [15/16]
+Accuracy: 0.93、Precision: 0.79、Recall: 0.86、F1-score: 0.83、Average_Precision: 0.92
+
+11/08 03:43:39 - Epoch(test) - inshore: [15/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.93、Precision: 0.66、Recall: 0.78、F1-score: 0.71、Average_Precision: 0.77
+11/08 03:43:55 - Best model achieved at epoch 15, with all test image AP 0.9217
+11/08 03:44:23 - Epoch(train)  [16/100][5/29]  lr: 8.8308e-04  eta: 3:48:27  time: 27.8610   loss: 0.1089
+11/08 03:44:28 - Epoch(train)  [16/100][10/29]  lr: 8.6870e-04  eta: 2:17:51  time: 33.6917   loss: 0.1263
+11/08 03:44:35 - Epoch(train)  [16/100][15/29]  lr: 8.5363e-04  eta: 1:49:19  time: 40.1622   loss: 0.1244
+11/08 03:44:42 - Epoch(train)  [16/100][20/29]  lr: 8.3788e-04  eta: 1:35:22  time: 46.8138   loss: 0.0935
+11/08 03:44:53 - Epoch(train)  [16/100][25/29]  lr: 8.2148e-04  eta: 1:34:53  time: 58.3357   loss: 0.0951
+11/08 03:45:24 - Epoch(train)  [17/100][5/29]  lr: 7.9046e-04  eta: 3:45:8  time: 27.7842   loss: 0.1055
+11/08 03:45:31 - Epoch(train)  [17/100][10/29]  lr: 7.7243e-04  eta: 2:18:2  time: 34.1399   loss: 0.0850
+11/08 03:45:37 - Epoch(train)  [17/100][15/29]  lr: 7.5389e-04  eta: 1:49:58  time: 40.8828   loss: 0.1678
+11/08 03:45:44 - Epoch(train)  [17/100][20/29]  lr: 7.3487e-04  eta: 1:36:17  time: 47.8232   loss: 0.0908
+11/08 03:45:56 - Epoch(train)  [17/100][25/29]  lr: 7.1540e-04  eta: 1:36:4  time: 59.7749   loss: 0.1487
+11/08 03:46:28 - Epoch(train)  [18/100][5/29]  lr: 6.7934e-04  eta: 3:41:59  time: 27.7261   loss: 0.1064
+11/08 03:46:33 - Epoch(train)  [18/100][10/29]  lr: 6.5882e-04  eta: 2:13:10  time: 33.3369   loss: 0.0864
+11/08 03:46:40 - Epoch(train)  [18/100][15/29]  lr: 6.3800e-04  eta: 1:46:26  time: 40.0470   loss: 0.0917
+11/08 03:46:46 - Epoch(train)  [18/100][20/29]  lr: 6.1691e-04  eta: 1:32:37  time: 46.5619   loss: 0.0736
+11/08 03:46:58 - Epoch(train)  [18/100][25/29]  lr: 5.9561e-04  eta: 1:31:43  time: 57.7595   loss: 0.1030
+11/08 03:47:28 - Epoch(train)  [19/100][5/29]  lr: 5.5682e-04  eta: 3:34:2  time: 27.0600   loss: 0.0796
+11/08 03:47:34 - Epoch(train)  [19/100][10/29]  lr: 5.3511e-04  eta: 2:10:14  time: 32.9985   loss: 0.0729
+11/08 03:47:40 - Epoch(train)  [19/100][15/29]  lr: 5.1333e-04  eta: 1:42:27  time: 39.0236   loss: 0.0792
+11/08 03:47:47 - Epoch(train)  [19/100][20/29]  lr: 4.9153e-04  eta: 1:30:23  time: 45.9982   loss: 0.0672
+11/08 03:47:59 - Epoch(train)  [19/100][25/29]  lr: 4.6974e-04  eta: 1:31:19  time: 58.2234   loss: 0.1078
+11/08 03:48:30 - Epoch(train)  [20/100][5/29]  lr: 4.3070e-04  eta: 3:33:18  time: 27.3003   loss: 0.0724
+11/08 03:48:37 - Epoch(train)  [20/100][10/29]  lr: 4.0918e-04  eta: 2:11:57  time: 33.8506   loss: 0.0986
+11/08 03:48:43 - Epoch(train)  [20/100][15/29]  lr: 3.8783e-04  eta: 1:44:7  time: 40.1524   loss: 0.0757
+11/08 03:48:50 - Epoch(train)  [20/100][20/29]  lr: 3.6670e-04  eta: 1:31:4  time: 46.9219   loss: 0.0545
+11/08 03:49:01 - Epoch(train)  [20/100][25/29]  lr: 3.4582e-04  eta: 1:30:29  time: 58.4051   loss: 0.0683
+
+11/08 03:49:04 - Epoch(test) - all: [20/100]:
+Threshold is drived from OTSU algorithm.
+11/08 03:49:33 - Epoch(test) : [5/16]
+11/08 03:49:39 - Epoch(test) : [10/16]
+11/08 03:49:46 - Epoch(test) : [15/16]
+Accuracy: 0.94、Precision: 0.79、Recall: 0.89、F1-score: 0.84、Average_Precision: 0.94
+
+11/08 03:49:48 - Epoch(test) - inshore: [20/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.94、Precision: 0.70、Recall: 0.80、F1-score: 0.75、Average_Precision: 0.81
+11/08 03:50:04 - Best model achieved at epoch 20, with all test image AP 0.9371
+11/08 03:50:31 - Epoch(train)  [21/100][5/29]  lr: 3.0900e-04  eta: 3:28:7  time: 26.9698   loss: 0.0512
+11/08 03:50:37 - Epoch(train)  [21/100][10/29]  lr: 2.8905e-04  eta: 2:7:11  time: 33.0359   loss: 0.0582
+11/08 03:50:44 - Epoch(train)  [21/100][15/29]  lr: 2.6949e-04  eta: 1:41:14  time: 39.5326   loss: 0.0670
+11/08 03:50:50 - Epoch(train)  [21/100][20/29]  lr: 2.5038e-04  eta: 1:27:43  time: 45.7663   loss: 0.0627
+11/08 03:51:01 - Epoch(train)  [21/100][25/29]  lr: 2.3173e-04  eta: 1:27:37  time: 57.2721   loss: 0.0704
+11/08 03:51:34 - Epoch(train)  [22/100][5/29]  lr: 1.9949e-04  eta: 3:38:22  time: 28.6583   loss: 0.0577
+11/08 03:51:40 - Epoch(train)  [22/100][10/29]  lr: 1.8237e-04  eta: 2:12:36  time: 34.8811   loss: 0.1438
+11/08 03:51:47 - Epoch(train)  [22/100][15/29]  lr: 1.6585e-04  eta: 1:44:57  time: 41.5068   loss: 0.0639
+11/08 03:51:54 - Epoch(train)  [22/100][20/29]  lr: 1.4997e-04  eta: 1:31:41  time: 48.4475   loss: 0.0608
+11/08 03:52:05 - Epoch(train)  [22/100][25/29]  lr: 1.3476e-04  eta: 1:30:13  time: 59.7275   loss: 0.0517
+11/08 03:52:36 - Epoch(train)  [23/100][5/29]  lr: 1.0914e-04  eta: 3:24:59  time: 27.2469   loss: 0.0594
+11/08 03:52:42 - Epoch(train)  [23/100][10/29]  lr: 9.5944e-05  eta: 2:7:40  time: 34.0179   loss: 0.0551
+11/08 03:52:49 - Epoch(train)  [23/100][15/29]  lr: 8.3516e-05  eta: 1:41:34  time: 40.6843   loss: 0.0568
+11/08 03:52:56 - Epoch(train)  [23/100][20/29]  lr: 7.1881e-05  eta: 1:28:9  time: 47.1836   loss: 0.0759
+11/08 03:53:08 - Epoch(train)  [23/100][25/29]  lr: 6.1061e-05  eta: 1:28:34  time: 59.3898   loss: 0.0460
+11/08 03:53:39 - Epoch(train)  [24/100][5/29]  lr: 4.3706e-05  eta: 3:27:19  time: 27.9165   loss: 0.0832
+11/08 03:53:46 - Epoch(train)  [24/100][10/29]  lr: 3.5274e-05  eta: 2:7:54  time: 34.5210   loss: 0.0764
+11/08 03:53:52 - Epoch(train)  [24/100][15/29]  lr: 2.7727e-05  eta: 1:40:18  time: 40.7029   loss: 0.0629
+11/08 03:53:59 - Epoch(train)  [24/100][20/29]  lr: 2.1080e-05  eta: 1:27:33  time: 47.4810   loss: 0.0659
+11/08 03:54:11 - Epoch(train)  [24/100][25/29]  lr: 1.5345e-05  eta: 1:27:26  time: 59.4054   loss: 0.0538
+11/08 03:54:42 - Epoch(train)  [25/100][5/29]  lr: 7.3538e-06  eta: 3:21:23  time: 27.4740   loss: 0.0695
+11/08 03:54:48 - Epoch(train)  [25/100][10/29]  lr: 4.2251e-06  eta: 2:3:8  time: 33.6766   loss: 0.0486
+11/08 03:54:55 - Epoch(train)  [25/100][15/29]  lr: 2.0406e-06  eta: 1:37:34  time: 40.1173   loss: 0.0498
+11/08 03:55:02 - Epoch(train)  [25/100][20/29]  lr: 8.0443e-07  eta: 1:25:24  time: 46.9276   loss: 0.0547
+11/08 03:55:13 - Epoch(train)  [25/100][25/29]  lr: 9.9998e-04  eta: 1:24:58  time: 58.4955   loss: 0.0728
+
+11/08 03:55:17 - Epoch(test) - all: [25/100]:
+Threshold is drived from OTSU algorithm.
+11/08 03:55:45 - Epoch(test) : [5/16]
+11/08 03:55:51 - Epoch(test) : [10/16]
+11/08 03:56:01 - Epoch(test) : [15/16]
+Accuracy: 0.93、Precision: 0.75、Recall: 0.87、F1-score: 0.81、Average_Precision: 0.93
+
+11/08 03:56:03 - Epoch(test) - inshore: [25/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.93、Precision: 0.66、Recall: 0.78、F1-score: 0.72、Average_Precision: 0.77
+11/08 03:56:45 - Epoch(train)  [26/100][5/29]  lr: 9.9810e-04  eta: 3:15:56  time: 27.0882   loss: 0.0638
+11/08 03:56:51 - Epoch(train)  [26/100][10/29]  lr: 9.9572e-04  eta: 1:59:33  time: 33.1360   loss: 0.0596
+11/08 03:56:58 - Epoch(train)  [26/100][15/29]  lr: 9.9241e-04  eta: 1:34:37  time: 39.4273   loss: 0.1133
+11/08 03:57:04 - Epoch(train)  [26/100][20/29]  lr: 9.8815e-04  eta: 1:22:48  time: 46.1069   loss: 0.0872
+11/08 03:57:16 - Epoch(train)  [26/100][25/29]  lr: 9.8297e-04  eta: 1:22:26  time: 57.5126   loss: 0.0806
+11/08 03:57:47 - Epoch(train)  [27/100][5/29]  lr: 9.7134e-04  eta: 3:12:10  time: 26.9279   loss: 0.0861
+11/08 03:57:53 - Epoch(train)  [27/100][10/29]  lr: 9.6361e-04  eta: 1:59:11  time: 33.4790   loss: 0.0980
+11/08 03:58:00 - Epoch(train)  [27/100][15/29]  lr: 9.5500e-04  eta: 1:35:29  time: 40.3273   loss: 0.0581
+11/08 03:58:06 - Epoch(train)  [27/100][20/29]  lr: 9.4553e-04  eta: 1:22:54  time: 46.7989   loss: 0.0725
+11/08 03:58:18 - Epoch(train)  [27/100][25/29]  lr: 9.3521e-04  eta: 1:22:58  time: 58.6814   loss: 0.0847
+11/08 03:58:48 - Epoch(train)  [28/100][5/29]  lr: 9.1456e-04  eta: 3:4:17  time: 26.1769   loss: 0.0522
+11/08 03:58:55 - Epoch(train)  [28/100][10/29]  lr: 9.0198e-04  eta: 1:56:15  time: 33.1068   loss: 0.0860
+11/08 03:59:02 - Epoch(train)  [28/100][15/29]  lr: 8.8863e-04  eta: 1:32:33  time: 39.6315   loss: 0.0874
+11/08 03:59:08 - Epoch(train)  [28/100][20/29]  lr: 8.7454e-04  eta: 1:21:9  time: 46.4408   loss: 0.0690
+11/08 03:59:19 - Epoch(train)  [28/100][25/29]  lr: 8.5974e-04  eta: 1:19:20  time: 56.8854   loss: 0.0885
+11/08 03:59:51 - Epoch(train)  [29/100][5/29]  lr: 8.3139e-04  eta: 3:19:28  time: 28.7287   loss: 0.0734
+11/08 03:59:58 - Epoch(train)  [29/100][10/29]  lr: 8.1475e-04  eta: 2:2:21  time: 35.3284   loss: 0.0456
+11/08 04:00:05 - Epoch(train)  [29/100][15/29]  lr: 7.9751e-04  eta: 1:37:5  time: 42.1528   loss: 0.0585
+11/08 04:00:11 - Epoch(train)  [29/100][20/29]  lr: 7.7971e-04  eta: 1:23:4  time: 48.2081   loss: 0.0566
+11/08 04:00:22 - Epoch(train)  [29/100][25/29]  lr: 7.6137e-04  eta: 1:22:11  time: 59.7649   loss: 0.0367
+11/08 04:00:53 - Epoch(train)  [30/100][5/29]  lr: 7.2713e-04  eta: 3:5:26  time: 27.0853   loss: 0.0501
+11/08 04:00:59 - Epoch(train)  [30/100][10/29]  lr: 7.0749e-04  eta: 1:53:58  time: 33.3730   loss: 0.0518
+11/08 04:01:07 - Epoch(train)  [30/100][15/29]  lr: 6.8746e-04  eta: 1:32:21  time: 40.6659   loss: 0.0507
+11/08 04:01:13 - Epoch(train)  [30/100][20/29]  lr: 6.6707e-04  eta: 1:20:4  time: 47.1302   loss: 0.0317
+11/08 04:01:24 - Epoch(train)  [30/100][25/29]  lr: 6.4636e-04  eta: 1:18:13  time: 57.6852   loss: 0.1115
+
+11/08 04:01:27 - Epoch(test) - all: [30/100]:
+Threshold is drived from OTSU algorithm.
+11/08 04:01:55 - Epoch(test) : [5/16]
+11/08 04:02:02 - Epoch(test) : [10/16]
+11/08 04:02:09 - Epoch(test) : [15/16]
+Accuracy: 0.94、Precision: 0.79、Recall: 0.90、F1-score: 0.84、Average_Precision: 0.94
+
+11/08 04:02:11 - Epoch(test) - inshore: [30/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.94、Precision: 0.70、Recall: 0.82、F1-score: 0.76、Average_Precision: 0.82
+11/08 04:02:28 - Best model achieved at epoch 30, with all test image AP 0.9395
+11/08 04:02:55 - Epoch(train)  [31/100][5/29]  lr: 6.0842e-04  eta: 3:2:12  time: 26.9926   loss: 0.0312
+11/08 04:03:02 - Epoch(train)  [31/100][10/29]  lr: 5.8703e-04  eta: 1:54:48  time: 34.1022   loss: 0.0783
+11/08 04:03:09 - Epoch(train)  [31/100][15/29]  lr: 5.6548e-04  eta: 1:31:27  time: 40.8508   loss: 0.0506
+11/08 04:03:15 - Epoch(train)  [31/100][20/29]  lr: 5.4381e-04  eta: 1:18:58  time: 47.1521   loss: 0.0645
+11/08 04:03:26 - Epoch(train)  [31/100][25/29]  lr: 5.2205e-04  eta: 1:16:40  time: 57.3681   loss: 0.0644
+11/08 04:03:58 - Epoch(train)  [32/100][5/29]  lr: 4.8281e-04  eta: 3:4:21  time: 27.7102   loss: 0.0455
+11/08 04:04:04 - Epoch(train)  [32/100][10/29]  lr: 4.6104e-04  eta: 1:54:0  time: 34.3586   loss: 0.0385
+11/08 04:04:11 - Epoch(train)  [32/100][15/29]  lr: 4.3935e-04  eta: 1:29:54  time: 40.7413   loss: 0.0323
+11/08 04:04:17 - Epoch(train)  [32/100][20/29]  lr: 4.1777e-04  eta: 1:17:57  time: 47.2218   loss: 0.0440
+11/08 04:04:30 - Epoch(train)  [32/100][25/29]  lr: 3.9635e-04  eta: 1:18:39  time: 59.7157   loss: 0.0563
+11/08 04:05:01 - Epoch(train)  [33/100][5/29]  lr: 3.5831e-04  eta: 3:1:39  time: 27.7061   loss: 0.0459
+11/08 04:05:07 - Epoch(train)  [33/100][10/29]  lr: 3.3755e-04  eta: 1:50:46  time: 33.8775   loss: 0.0260
+11/08 04:05:14 - Epoch(train)  [33/100][15/29]  lr: 3.1709e-04  eta: 1:27:12  time: 40.1041   loss: 0.0340
+11/08 04:05:20 - Epoch(train)  [33/100][20/29]  lr: 2.9698e-04  eta: 1:16:10  time: 46.8269   loss: 0.0347
+11/08 04:05:31 - Epoch(train)  [33/100][25/29]  lr: 2.7726e-04  eta: 1:15:15  time: 57.9838   loss: 0.0292
+11/08 04:06:02 - Epoch(train)  [34/100][5/29]  lr: 2.4286e-04  eta: 2:53:19  time: 26.8308   loss: 0.0240
+11/08 04:06:09 - Epoch(train)  [34/100][10/29]  lr: 2.2442e-04  eta: 1:49:22  time: 33.9490   loss: 0.0323
+11/08 04:06:16 - Epoch(train)  [34/100][15/29]  lr: 2.0650e-04  eta: 1:26:20  time: 40.3078   loss: 0.0633
+11/08 04:06:22 - Epoch(train)  [34/100][20/29]  lr: 1.8915e-04  eta: 1:15:3  time: 46.8355   loss: 0.0336
+11/08 04:06:33 - Epoch(train)  [34/100][25/29]  lr: 1.7238e-04  eta: 1:13:27  time: 57.4553   loss: 0.0269
+11/08 04:07:04 - Epoch(train)  [35/100][5/29]  lr: 1.4380e-04  eta: 2:56:37  time: 27.7565   loss: 0.0407
+11/08 04:07:11 - Epoch(train)  [35/100][10/29]  lr: 1.2886e-04  eta: 1:48:21  time: 34.1481   loss: 0.0400
+11/08 04:07:17 - Epoch(train)  [35/100][15/29]  lr: 1.1463e-04  eta: 1:25:42  time: 40.6229   loss: 0.0160
+11/08 04:07:24 - Epoch(train)  [35/100][20/29]  lr: 1.0113e-04  eta: 1:14:9  time: 46.9839   loss: 0.0193
+11/08 04:07:35 - Epoch(train)  [35/100][25/29]  lr: 8.8393e-05  eta: 1:13:51  time: 58.6547   loss: 0.0220
+
+11/08 04:07:39 - Epoch(test) - all: [35/100]:
+Threshold is drived from OTSU algorithm.
+11/08 04:08:07 - Epoch(test) : [5/16]
+11/08 04:08:14 - Epoch(test) : [10/16]
+11/08 04:08:21 - Epoch(test) : [15/16]
+Accuracy: 0.94、Precision: 0.79、Recall: 0.89、F1-score: 0.84、Average_Precision: 0.94
+
+11/08 04:08:23 - Epoch(test) - inshore: [35/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.94、Precision: 0.71、Recall: 0.81、F1-score: 0.76、Average_Precision: 0.84
+11/08 04:08:39 - Best model achieved at epoch 35, with all test image AP 0.9438
+11/08 04:09:07 - Epoch(train)  [36/100][5/29]  lr: 6.7454e-05  eta: 2:55:26  time: 27.9961   loss: 0.0149
+11/08 04:09:13 - Epoch(train)  [36/100][10/29]  lr: 5.6966e-05  eta: 1:46:29  time: 34.0750   loss: 0.0178
+11/08 04:09:22 - Epoch(train)  [36/100][15/29]  lr: 4.7323e-05  eta: 1:29:49  time: 43.2334   loss: 0.0134
+11/08 04:09:29 - Epoch(train)  [36/100][20/29]  lr: 3.8541e-05  eta: 1:17:57  time: 50.1625   loss: 0.0238
+11/08 04:09:38 - Epoch(train)  [36/100][25/29]  lr: 3.0639e-05  eta: 1:12:32  time: 58.4955   loss: 0.0221
+11/08 04:10:10 - Epoch(train)  [37/100][5/29]  lr: 1.8676e-05  eta: 2:45:25  time: 26.8106   loss: 0.0141
+11/08 04:10:18 - Epoch(train)  [37/100][10/29]  lr: 1.3309e-05  eta: 1:48:49  time: 35.3711   loss: 0.0127
+11/08 04:10:25 - Epoch(train)  [37/100][15/29]  lr: 8.8684e-06  eta: 1:25:55  time: 42.0052   loss: 0.0135
+11/08 04:10:32 - Epoch(train)  [37/100][20/29]  lr: 5.3635e-06  eta: 1:14:11  time: 48.4961   loss: 0.0137
+11/08 04:10:41 - Epoch(train)  [37/100][25/29]  lr: 2.8007e-06  eta: 1:10:18  time: 57.6041   loss: 0.0154
+11/08 04:11:12 - Epoch(train)  [38/100][5/29]  lr: 5.7611e-07  eta: 2:44:25  time: 27.0734   loss: 0.0139
+11/08 04:11:20 - Epoch(train)  [38/100][10/29]  lr: 9.9983e-04  eta: 1:43:56  time: 34.3206   loss: 0.0276
+11/08 04:11:26 - Epoch(train)  [38/100][15/29]  lr: 9.9878e-04  eta: 1:21:47  time: 40.6285   loss: 0.0324
+11/08 04:11:32 - Epoch(train)  [38/100][20/29]  lr: 9.9679e-04  eta: 1:11:3  time: 47.1872   loss: 0.0744
+11/08 04:11:44 - Epoch(train)  [38/100][25/29]  lr: 9.9385e-04  eta: 1:9:59  time: 58.2683   loss: 0.0587
+11/08 04:12:16 - Epoch(train)  [39/100][5/29]  lr: 9.8619e-04  eta: 2:54:7  time: 29.1347   loss: 0.0670
+11/08 04:12:23 - Epoch(train)  [39/100][10/29]  lr: 9.8064e-04  eta: 1:46:20  time: 35.6825   loss: 0.0561
+11/08 04:12:29 - Epoch(train)  [39/100][15/29]  lr: 9.7417e-04  eta: 1:23:27  time: 42.1243   loss: 0.0595
+11/08 04:12:36 - Epoch(train)  [39/100][20/29]  lr: 9.6681e-04  eta: 1:12:20  time: 48.8199   loss: 0.0792
+11/08 04:12:47 - Epoch(train)  [39/100][25/29]  lr: 9.5855e-04  eta: 1:10:53  time: 59.9775   loss: 0.0638
+11/08 04:13:18 - Epoch(train)  [40/100][5/29]  lr: 9.4150e-04  eta: 2:44:47  time: 28.0271   loss: 0.0404
+11/08 04:13:24 - Epoch(train)  [40/100][10/29]  lr: 9.3085e-04  eta: 1:39:53  time: 34.0712   loss: 0.0657
+11/08 04:13:31 - Epoch(train)  [40/100][15/29]  lr: 9.1938e-04  eta: 1:19:11  time: 40.6332   loss: 0.0400
+11/08 04:13:37 - Epoch(train)  [40/100][20/29]  lr: 9.0710e-04  eta: 1:8:29  time: 46.9960   loss: 0.0445
+11/08 04:13:50 - Epoch(train)  [40/100][25/29]  lr: 8.9406e-04  eta: 1:8:53  time: 59.2490   loss: 0.0777
+
+11/08 04:13:53 - Epoch(test) - all: [40/100]:
+Threshold is drived from OTSU algorithm.
+11/08 04:14:22 - Epoch(test) : [5/16]
+11/08 04:14:27 - Epoch(test) : [10/16]
+11/08 04:14:33 - Epoch(test) : [15/16]
+Accuracy: 0.94、Precision: 0.78、Recall: 0.89、F1-score: 0.83、Average_Precision: 0.94
+
+11/08 04:14:36 - Epoch(test) - inshore: [40/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.93、Precision: 0.69、Recall: 0.81、F1-score: 0.75、Average_Precision: 0.80
+11/08 04:15:20 - Epoch(train)  [41/100][5/29]  lr: 8.6870e-04  eta: 2:49:34  time: 29.3207   loss: 0.0543
+11/08 04:15:27 - Epoch(train)  [41/100][10/29]  lr: 8.5363e-04  eta: 1:44:16  time: 36.1671   loss: 0.0323
+11/08 04:15:33 - Epoch(train)  [41/100][15/29]  lr: 8.3788e-04  eta: 1:22:1  time: 42.7966   loss: 0.0638
+11/08 04:15:41 - Epoch(train)  [41/100][20/29]  lr: 8.2148e-04  eta: 1:11:41  time: 50.0118   loss: 0.0311
+11/08 04:15:52 - Epoch(train)  [41/100][25/29]  lr: 8.0448e-04  eta: 1:10:7  time: 61.3401   loss: 0.0311
+11/08 04:16:24 - Epoch(train)  [42/100][5/29]  lr: 7.7243e-04  eta: 2:39:36  time: 28.0666   loss: 0.0299
+11/08 04:16:30 - Epoch(train)  [42/100][10/29]  lr: 7.5389e-04  eta: 1:36:17  time: 33.9626   loss: 0.0244
+11/08 04:16:37 - Epoch(train)  [42/100][15/29]  lr: 7.3487e-04  eta: 1:17:13  time: 40.9817   loss: 0.0289
+11/08 04:16:44 - Epoch(train)  [42/100][20/29]  lr: 7.1540e-04  eta: 1:7:31  time: 47.9126   loss: 0.0264
+11/08 04:16:56 - Epoch(train)  [42/100][25/29]  lr: 6.9552e-04  eta: 1:7:3  time: 59.6574   loss: 0.0241
+11/08 04:17:26 - Epoch(train)  [43/100][5/29]  lr: 6.5882e-04  eta: 2:31:56  time: 27.1797   loss: 0.0168
+11/08 04:17:32 - Epoch(train)  [43/100][10/29]  lr: 6.3800e-04  eta: 1:33:36  time: 33.5889   loss: 0.0225
+11/08 04:17:39 - Epoch(train)  [43/100][15/29]  lr: 6.1691e-04  eta: 1:13:51  time: 39.8770   loss: 0.0331
+11/08 04:17:46 - Epoch(train)  [43/100][20/29]  lr: 5.9561e-04  eta: 1:4:52  time: 46.8433   loss: 0.0184
+11/08 04:17:57 - Epoch(train)  [43/100][25/29]  lr: 5.7412e-04  eta: 1:4:8  time: 58.0601   loss: 0.0351
+11/08 04:18:26 - Epoch(train)  [44/100][5/29]  lr: 5.3511e-04  eta: 2:27:19  time: 26.8177   loss: 0.0204
+11/08 04:18:32 - Epoch(train)  [44/100][10/29]  lr: 5.1333e-04  eta: 1:29:59  time: 32.8662   loss: 0.0182
+11/08 04:18:43 - Epoch(train)  [44/100][15/29]  lr: 4.9153e-04  eta: 1:18:14  time: 42.9896   loss: 0.0157
+11/08 04:18:49 - Epoch(train)  [44/100][20/29]  lr: 4.6974e-04  eta: 1:7:22  time: 49.5141   loss: 0.0143
+11/08 04:18:57 - Epoch(train)  [44/100][25/29]  lr: 4.4801e-04  eta: 1:1:51  time: 56.9985   loss: 0.0307
+11/08 04:19:31 - Epoch(train)  [45/100][5/29]  lr: 4.0918e-04  eta: 2:31:37  time: 28.0952   loss: 0.0156
+11/08 04:19:38 - Epoch(train)  [45/100][10/29]  lr: 3.8783e-04  eta: 1:34:19  time: 35.0648   loss: 0.0125
+11/08 04:19:45 - Epoch(train)  [45/100][15/29]  lr: 3.6670e-04  eta: 1:14:54  time: 41.8970   loss: 0.0119
+11/08 04:19:51 - Epoch(train)  [45/100][20/29]  lr: 3.4582e-04  eta: 1:4:34  time: 48.3127   loss: 0.0097
+11/08 04:20:03 - Epoch(train)  [45/100][25/29]  lr: 3.2523e-04  eta: 1:3:43  time: 59.7719   loss: 0.0103
+
+11/08 04:20:06 - Epoch(test) - all: [45/100]:
+Threshold is drived from OTSU algorithm.
+11/08 04:20:34 - Epoch(test) : [5/16]
+11/08 04:20:40 - Epoch(test) : [10/16]
+11/08 04:20:46 - Epoch(test) : [15/16]
+Accuracy: 0.92、Precision: 0.74、Recall: 0.89、F1-score: 0.81、Average_Precision: 0.94
+
+11/08 04:20:48 - Epoch(test) - inshore: [45/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.94、Precision: 0.73、Recall: 0.81、F1-score: 0.77、Average_Precision: 0.83
+11/08 04:21:30 - Epoch(train)  [46/100][5/29]  lr: 2.8905e-04  eta: 2:21:13  time: 26.6473   loss: 0.0154
+11/08 04:21:38 - Epoch(train)  [46/100][10/29]  lr: 2.6949e-04  eta: 1:30:52  time: 34.3976   loss: 0.0101
+11/08 04:21:44 - Epoch(train)  [46/100][15/29]  lr: 2.5038e-04  eta: 1:11:32  time: 40.7502   loss: 0.0101
+11/08 04:21:50 - Epoch(train)  [46/100][20/29]  lr: 2.3173e-04  eta: 1:1:41  time: 46.9972   loss: 0.0103
+11/08 04:22:01 - Epoch(train)  [46/100][25/29]  lr: 2.1361e-04  eta: 1:0:2  time: 57.3627   loss: 0.0051
+11/08 04:22:32 - Epoch(train)  [47/100][5/29]  lr: 1.8237e-04  eta: 2:22:56  time: 27.4716   loss: 0.0054
+11/08 04:22:39 - Epoch(train)  [47/100][10/29]  lr: 1.6585e-04  eta: 1:27:40  time: 33.8110   loss: 0.0050
+11/08 04:22:45 - Epoch(train)  [47/100][15/29]  lr: 1.4997e-04  eta: 1:8:56  time: 40.0074   loss: 0.0086
+11/08 04:22:51 - Epoch(train)  [47/100][20/29]  lr: 1.3476e-04  eta: 1:0:5  time: 46.6421   loss: 0.0046
+11/08 04:23:04 - Epoch(train)  [47/100][25/29]  lr: 1.2024e-04  eta: 1:0:28  time: 58.8673   loss: 0.0027
+11/08 04:23:33 - Epoch(train)  [48/100][5/29]  lr: 9.5944e-05  eta: 2:15:58  time: 26.6269   loss: 0.0061
+11/08 04:23:40 - Epoch(train)  [48/100][10/29]  lr: 8.3516e-05  eta: 1:25:46  time: 33.7034   loss: 0.0032
+11/08 04:23:47 - Epoch(train)  [48/100][15/29]  lr: 7.1881e-05  eta: 1:8:8  time: 40.2946   loss: 0.0041
+11/08 04:23:54 - Epoch(train)  [48/100][20/29]  lr: 6.1061e-05  eta: 0:59:10  time: 46.8102   loss: 0.0035
+11/08 04:24:06 - Epoch(train)  [48/100][25/29]  lr: 5.1078e-05  eta: 0:59:25  time: 58.9548   loss: 0.0029
+11/08 04:24:35 - Epoch(train)  [49/100][5/29]  lr: 3.5274e-05  eta: 2:13:6  time: 26.5684   loss: 0.0022
+11/08 04:24:45 - Epoch(train)  [49/100][10/29]  lr: 2.7727e-05  eta: 1:29:42  time: 35.9309   loss: 0.0025
+11/08 04:24:51 - Epoch(train)  [49/100][15/29]  lr: 2.1080e-05  eta: 1:9:36  time: 41.9654   loss: 0.0047
+11/08 04:24:58 - Epoch(train)  [49/100][20/29]  lr: 1.5345e-05  eta: 1:0:39  time: 48.9140   loss: 0.0021
+11/08 04:25:05 - Epoch(train)  [49/100][25/29]  lr: 1.0533e-05  eta: 0:55:30  time: 56.1439   loss: 0.0059
+11/08 04:25:39 - Epoch(train)  [50/100][5/29]  lr: 4.2251e-06  eta: 2:14:33  time: 27.3848   loss: 0.0018
+11/08 04:25:46 - Epoch(train)  [50/100][10/29]  lr: 2.0406e-06  eta: 1:22:55  time: 33.8711   loss: 0.0029
+11/08 04:25:54 - Epoch(train)  [50/100][15/29]  lr: 8.0443e-07  eta: 1:9:0  time: 42.4254   loss: 0.0017
+11/08 04:26:01 - Epoch(train)  [50/100][20/29]  lr: 9.9998e-04  eta: 0:59:38  time: 49.0565   loss: 0.0025
+11/08 04:26:10 - Epoch(train)  [50/100][25/29]  lr: 9.9932e-04  eta: 0:56:22  time: 58.1620   loss: 0.0029
+
+11/08 04:26:15 - Epoch(test) - all: [50/100]:
+Threshold is drived from OTSU algorithm.
+11/08 04:26:43 - Epoch(test) : [5/16]
+11/08 04:26:50 - Epoch(test) : [10/16]
+11/08 04:26:57 - Epoch(test) : [15/16]
+Accuracy: 0.86、Precision: 0.57、Recall: 0.87、F1-score: 0.69、Average_Precision: 0.94
+
+11/08 04:26:59 - Epoch(test) - inshore: [50/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.93、Precision: 0.67、Recall: 0.78、F1-score: 0.72、Average_Precision: 0.83
+11/08 04:27:44 - Epoch(train)  [51/100][5/29]  lr: 9.9572e-04  eta: 2:15:59  time: 28.2341   loss: 0.0120
+11/08 04:27:50 - Epoch(train)  [51/100][10/29]  lr: 9.9241e-04  eta: 1:22:41  time: 34.4532   loss: 0.0359
+11/08 04:27:57 - Epoch(train)  [51/100][15/29]  lr: 9.8815e-04  eta: 1:5:27  time: 41.0568   loss: 0.0226
+11/08 04:28:04 - Epoch(train)  [51/100][20/29]  lr: 9.8297e-04  eta: 0:57:5  time: 47.9053   loss: 0.0518
+11/08 04:28:16 - Epoch(train)  [51/100][25/29]  lr: 9.7687e-04  eta: 0:56:45  time: 59.7538   loss: 0.0275
+11/08 04:28:46 - Epoch(train)  [52/100][5/29]  lr: 9.6361e-04  eta: 2:11:28  time: 27.8541   loss: 0.0995
+11/08 04:28:52 - Epoch(train)  [52/100][10/29]  lr: 9.5500e-04  eta: 1:20:3  time: 34.0462   loss: 0.0719
+11/08 04:28:59 - Epoch(train)  [52/100][15/29]  lr: 9.4553e-04  eta: 1:3:48  time: 40.8411   loss: 0.0434
+11/08 04:29:05 - Epoch(train)  [52/100][20/29]  lr: 9.3521e-04  eta: 0:55:2  time: 47.1485   loss: 0.0497
+11/08 04:29:18 - Epoch(train)  [52/100][25/29]  lr: 9.2406e-04  eta: 0:55:6  time: 59.2051   loss: 0.0305
+11/08 04:29:48 - Epoch(train)  [53/100][5/29]  lr: 9.0198e-04  eta: 2:8:4  time: 27.7019   loss: 0.0390
+11/08 04:29:55 - Epoch(train)  [53/100][10/29]  lr: 8.8863e-04  eta: 1:18:6  time: 33.9132   loss: 0.0402
+11/08 04:30:01 - Epoch(train)  [53/100][15/29]  lr: 8.7454e-04  eta: 1:1:59  time: 40.5130   loss: 0.0281
+11/08 04:30:08 - Epoch(train)  [53/100][20/29]  lr: 8.5974e-04  eta: 0:53:31  time: 46.8212   loss: 0.0320
+11/08 04:30:20 - Epoch(train)  [53/100][25/29]  lr: 8.4426e-04  eta: 0:53:43  time: 58.9507   loss: 0.0399
+11/08 04:30:51 - Epoch(train)  [54/100][5/29]  lr: 8.1475e-04  eta: 2:8:1  time: 28.2841   loss: 0.0247
+11/08 04:30:58 - Epoch(train)  [54/100][10/29]  lr: 7.9751e-04  eta: 1:18:41  time: 34.8982   loss: 0.0106
+11/08 04:31:04 - Epoch(train)  [54/100][15/29]  lr: 7.7971e-04  eta: 1:1:4  time: 40.7781   loss: 0.0116
+11/08 04:31:10 - Epoch(train)  [54/100][20/29]  lr: 7.6137e-04  eta: 0:52:59  time: 47.3532   loss: 0.0149
+11/08 04:31:22 - Epoch(train)  [54/100][25/29]  lr: 7.4253e-04  eta: 0:52:42  time: 59.0919   loss: 0.0131
+11/08 04:31:53 - Epoch(train)  [55/100][5/29]  lr: 7.0749e-04  eta: 2:2:7  time: 27.5686   loss: 0.0174
+11/08 04:31:59 - Epoch(train)  [55/100][10/29]  lr: 6.8746e-04  eta: 1:14:38  time: 33.8261   loss: 0.0425
+11/08 04:32:06 - Epoch(train)  [55/100][15/29]  lr: 6.6707e-04  eta: 0:58:45  time: 40.0968   loss: 0.0230
+11/08 04:32:12 - Epoch(train)  [55/100][20/29]  lr: 6.4636e-04  eta: 0:50:28  time: 46.0900   loss: 0.0242
+11/08 04:32:24 - Epoch(train)  [55/100][25/29]  lr: 6.2538e-04  eta: 0:50:31  time: 57.8953   loss: 0.0172
+
+11/08 04:32:27 - Epoch(test) - all: [55/100]:
+Threshold is drived from OTSU algorithm.
+11/08 04:32:55 - Epoch(test) : [5/16]
+11/08 04:33:01 - Epoch(test) : [10/16]
+11/08 04:33:07 - Epoch(test) : [15/16]
+Accuracy: 0.93、Precision: 0.78、Recall: 0.87、F1-score: 0.83、Average_Precision: 0.94
+
+11/08 04:33:09 - Epoch(test) - inshore: [55/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.94、Precision: 0.76、Recall: 0.77、F1-score: 0.77、Average_Precision: 0.83
+11/08 04:33:52 - Epoch(train)  [56/100][5/29]  lr: 5.8703e-04  eta: 1:58:26  time: 27.3329   loss: 0.0381
+11/08 04:33:59 - Epoch(train)  [56/100][10/29]  lr: 5.6548e-04  eta: 1:14:26  time: 34.4937   loss: 0.0081
+11/08 04:34:06 - Epoch(train)  [56/100][15/29]  lr: 5.4381e-04  eta: 0:58:53  time: 41.0922   loss: 0.0116
+11/08 04:34:13 - Epoch(train)  [56/100][20/29]  lr: 5.2205e-04  eta: 0:51:20  time: 47.9533   loss: 0.0068
+11/08 04:34:23 - Epoch(train)  [56/100][25/29]  lr: 5.0025e-04  eta: 0:49:37  time: 58.1467   loss: 0.0172
+11/08 04:34:53 - Epoch(train)  [57/100][5/29]  lr: 4.6104e-04  eta: 1:54:50  time: 27.1075   loss: 0.0049
+11/08 04:35:00 - Epoch(train)  [57/100][10/29]  lr: 4.3935e-04  eta: 1:11:4  time: 33.6830   loss: 0.0043
+11/08 04:35:08 - Epoch(train)  [57/100][15/29]  lr: 4.1777e-04  eta: 0:58:8  time: 41.4983   loss: 0.0080
+11/08 04:35:14 - Epoch(train)  [57/100][20/29]  lr: 3.9635e-04  eta: 0:49:45  time: 47.5356   loss: 0.0042
+11/08 04:35:24 - Epoch(train)  [57/100][25/29]  lr: 3.7512e-04  eta: 0:48:19  time: 57.9355   loss: 0.0066
+11/08 04:35:55 - Epoch(train)  [58/100][5/29]  lr: 3.3755e-04  eta: 1:53:59  time: 27.5356   loss: 0.0028
+11/08 04:36:01 - Epoch(train)  [58/100][10/29]  lr: 3.1709e-04  eta: 1:8:49  time: 33.3806   loss: 0.0047
+11/08 04:36:08 - Epoch(train)  [58/100][15/29]  lr: 2.9698e-04  eta: 0:54:32  time: 39.8467   loss: 0.0028
+11/08 04:36:14 - Epoch(train)  [58/100][20/29]  lr: 2.7726e-04  eta: 0:47:16  time: 46.2396   loss: 0.0055
+11/08 04:36:26 - Epoch(train)  [58/100][25/29]  lr: 2.5797e-04  eta: 0:47:0  time: 57.7111   loss: 0.0028
+11/08 04:36:56 - Epoch(train)  [59/100][5/29]  lr: 2.2442e-04  eta: 1:47:42  time: 26.6401   loss: 0.0032
+11/08 04:37:02 - Epoch(train)  [59/100][10/29]  lr: 2.0650e-04  eta: 1:6:17  time: 32.9281   loss: 0.0053
+11/08 04:37:09 - Epoch(train)  [59/100][15/29]  lr: 1.8915e-04  eta: 0:53:49  time: 40.2735   loss: 0.0008
+11/08 04:37:16 - Epoch(train)  [59/100][20/29]  lr: 1.7238e-04  eta: 0:46:52  time: 46.9547   loss: 0.0007
+11/08 04:37:27 - Epoch(train)  [59/100][25/29]  lr: 1.5624e-04  eta: 0:46:6  time: 57.9705   loss: 0.0006
+11/08 04:37:59 - Epoch(train)  [60/100][5/29]  lr: 1.2886e-04  eta: 1:51:42  time: 28.3041   loss: 0.0006
+11/08 04:38:05 - Epoch(train)  [60/100][10/29]  lr: 1.1463e-04  eta: 1:8:31  time: 34.8708   loss: 0.0006
+11/08 04:38:12 - Epoch(train)  [60/100][15/29]  lr: 1.0113e-04  eta: 0:53:33  time: 41.0619   loss: 0.0005
+11/08 04:38:18 - Epoch(train)  [60/100][20/29]  lr: 8.8393e-05  eta: 0:46:35  time: 47.8352   loss: 0.0007
+11/08 04:38:29 - Epoch(train)  [60/100][25/29]  lr: 7.6438e-05  eta: 0:45:41  time: 58.8828   loss: 0.0007
+
+11/08 04:38:33 - Epoch(test) - all: [60/100]:
+Threshold is drived from OTSU algorithm.
+11/08 04:39:03 - Epoch(test) : [5/16]
+11/08 04:39:10 - Epoch(test) : [10/16]
+11/08 04:39:16 - Epoch(test) : [15/16]
+Accuracy: 0.86、Precision: 0.57、Recall: 0.89、F1-score: 0.70、Average_Precision: 0.95
+
+11/08 04:39:18 - Epoch(test) - inshore: [60/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.93、Precision: 0.67、Recall: 0.81、F1-score: 0.73、Average_Precision: 0.84
+11/08 04:39:34 - Best model achieved at epoch 60, with all test image AP 0.9460
+11/08 04:40:02 - Epoch(train)  [61/100][5/29]  lr: 5.6966e-05  eta: 1:46:38  time: 27.6986   loss: 0.0006
+11/08 04:40:09 - Epoch(train)  [61/100][10/29]  lr: 4.7323e-05  eta: 1:5:18  time: 34.0775   loss: 0.0004
+11/08 04:40:15 - Epoch(train)  [61/100][15/29]  lr: 3.8541e-05  eta: 0:51:23  time: 40.3968   loss: 0.0017
+11/08 04:40:22 - Epoch(train)  [61/100][20/29]  lr: 3.0639e-05  eta: 0:44:39  time: 47.0095   loss: 0.0005
+11/08 04:40:33 - Epoch(train)  [61/100][25/29]  lr: 2.3630e-05  eta: 0:43:59  time: 58.1486   loss: 0.0006
+11/08 04:41:07 - Epoch(train)  [62/100][5/29]  lr: 1.3309e-05  eta: 1:52:0  time: 29.8402   loss: 0.0009
+11/08 04:41:13 - Epoch(train)  [62/100][10/29]  lr: 8.8684e-06  eta: 1:7:44  time: 36.2605   loss: 0.0007
+11/08 04:41:19 - Epoch(train)  [62/100][15/29]  lr: 5.3635e-06  eta: 0:52:42  time: 42.5016   loss: 0.0005
+11/08 04:41:26 - Epoch(train)  [62/100][20/29]  lr: 2.8007e-06  eta: 0:45:31  time: 49.1723   loss: 0.0004
+11/08 04:41:38 - Epoch(train)  [62/100][25/29]  lr: 1.1849e-06  eta: 0:45:13  time: 61.3391   loss: 0.0007
+11/08 04:42:09 - Epoch(train)  [63/100][5/29]  lr: 9.9983e-04  eta: 1:41:44  time: 27.8247   loss: 0.0006
+11/08 04:42:15 - Epoch(train)  [63/100][10/29]  lr: 9.9878e-04  eta: 1:2:2  time: 34.0885   loss: 0.0025
+11/08 04:42:22 - Epoch(train)  [63/100][15/29]  lr: 9.9679e-04  eta: 0:48:52  time: 40.4722   loss: 0.0050
+11/08 04:42:28 - Epoch(train)  [63/100][20/29]  lr: 9.9385e-04  eta: 0:42:0  time: 46.5894   loss: 0.0017
+11/08 04:42:40 - Epoch(train)  [63/100][25/29]  lr: 9.8997e-04  eta: 0:42:11  time: 58.7514   loss: 0.0029
+11/08 04:43:10 - Epoch(train)  [64/100][5/29]  lr: 9.8064e-04  eta: 1:36:27  time: 27.0931   loss: 0.0103
+11/08 04:43:16 - Epoch(train)  [64/100][10/29]  lr: 9.7417e-04  eta: 0:59:1  time: 33.3134   loss: 0.0182
+11/08 04:43:22 - Epoch(train)  [64/100][15/29]  lr: 9.6681e-04  eta: 0:46:3  time: 39.1748   loss: 0.0313
+11/08 04:43:28 - Epoch(train)  [64/100][20/29]  lr: 9.5855e-04  eta: 0:40:4  time: 45.6755   loss: 0.0495
+11/08 04:43:40 - Epoch(train)  [64/100][25/29]  lr: 9.4942e-04  eta: 0:39:53  time: 57.0875   loss: 0.0304
+11/08 04:44:14 - Epoch(train)  [65/100][5/29]  lr: 9.3085e-04  eta: 1:44:14  time: 30.1009   loss: 0.0182
+11/08 04:44:21 - Epoch(train)  [65/100][10/29]  lr: 9.1938e-04  eta: 1:3:40  time: 36.9484   loss: 0.0256
+11/08 04:44:28 - Epoch(train)  [65/100][15/29]  lr: 9.0710e-04  eta: 0:50:51  time: 44.4839   loss: 0.0399
+11/08 04:44:35 - Epoch(train)  [65/100][20/29]  lr: 8.9406e-04  eta: 0:43:57  time: 51.5218   loss: 0.0202
+11/08 04:44:47 - Epoch(train)  [65/100][25/29]  lr: 8.8026e-04  eta: 0:43:17  time: 63.7203   loss: 0.0243
+
+11/08 04:44:51 - Epoch(test) - all: [65/100]:
+Threshold is drived from OTSU algorithm.
+11/08 04:45:18 - Epoch(test) : [5/16]
+11/08 04:45:25 - Epoch(test) : [10/16]
+11/08 04:45:32 - Epoch(test) : [15/16]
+Accuracy: 0.92、Precision: 0.72、Recall: 0.87、F1-score: 0.79、Average_Precision: 0.94
+
+11/08 04:45:34 - Epoch(test) - inshore: [65/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.94、Precision: 0.74、Recall: 0.78、F1-score: 0.76、Average_Precision: 0.81
+11/08 04:46:21 - Epoch(train)  [66/100][5/29]  lr: 8.5363e-04  eta: 1:40:38  time: 29.8947   loss: 0.0304
+11/08 04:46:28 - Epoch(train)  [66/100][10/29]  lr: 8.3788e-04  eta: 1:1:47  time: 36.8877   loss: 0.0182
+11/08 04:46:35 - Epoch(train)  [66/100][15/29]  lr: 8.2148e-04  eta: 0:48:29  time: 43.6397   loss: 0.0174
+11/08 04:46:41 - Epoch(train)  [66/100][20/29]  lr: 8.0448e-04  eta: 0:41:36  time: 50.1873   loss: 0.0177
+11/08 04:46:54 - Epoch(train)  [66/100][25/29]  lr: 7.8689e-04  eta: 0:41:17  time: 62.5555   loss: 0.0094
+11/08 04:47:27 - Epoch(train)  [67/100][5/29]  lr: 7.5389e-04  eta: 1:39:22  time: 30.3922   loss: 0.0088
+11/08 04:47:34 - Epoch(train)  [67/100][10/29]  lr: 7.3487e-04  eta: 1:0:38  time: 37.2748   loss: 0.0111
+11/08 04:47:40 - Epoch(train)  [67/100][15/29]  lr: 7.1540e-04  eta: 0:47:41  time: 44.1974   loss: 0.0088
+11/08 04:47:47 - Epoch(train)  [67/100][20/29]  lr: 6.9552e-04  eta: 0:40:39  time: 50.5075   loss: 0.0076
+11/08 04:47:59 - Epoch(train)  [67/100][25/29]  lr: 6.7527e-04  eta: 0:40:5  time: 62.5684   loss: 0.0077
+11/08 04:48:33 - Epoch(train)  [68/100][5/29]  lr: 6.3800e-04  eta: 1:36:48  time: 30.5090   loss: 0.0043
+11/08 04:48:39 - Epoch(train)  [68/100][10/29]  lr: 6.1691e-04  eta: 0:57:51  time: 36.6526   loss: 0.0048
+11/08 04:48:46 - Epoch(train)  [68/100][15/29]  lr: 5.9561e-04  eta: 0:45:41  time: 43.6549   loss: 0.0060
+11/08 04:48:53 - Epoch(train)  [68/100][20/29]  lr: 5.7412e-04  eta: 0:39:26  time: 50.5173   loss: 0.0058
+11/08 04:49:06 - Epoch(train)  [68/100][25/29]  lr: 5.5249e-04  eta: 0:39:16  time: 63.2011   loss: 0.0059
+11/08 04:49:40 - Epoch(train)  [69/100][5/29]  lr: 5.1333e-04  eta: 1:31:22  time: 29.6988   loss: 0.0046
+11/08 04:49:47 - Epoch(train)  [69/100][10/29]  lr: 4.9153e-04  eta: 0:57:31  time: 37.6017   loss: 0.0049
+11/08 04:49:55 - Epoch(train)  [69/100][15/29]  lr: 4.6974e-04  eta: 0:45:30  time: 44.8618   loss: 0.0147
+11/08 04:50:01 - Epoch(train)  [69/100][20/29]  lr: 4.4801e-04  eta: 0:38:50  time: 51.3274   loss: 0.0089
+11/08 04:50:12 - Epoch(train)  [69/100][25/29]  lr: 4.2638e-04  eta: 0:37:39  time: 62.5518   loss: 0.0038
+11/08 04:50:48 - Epoch(train)  [70/100][5/29]  lr: 3.8783e-04  eta: 1:35:20  time: 31.9943   loss: 0.0088
+11/08 04:50:56 - Epoch(train)  [70/100][10/29]  lr: 3.6670e-04  eta: 0:58:41  time: 39.6117   loss: 0.0031
+11/08 04:51:03 - Epoch(train)  [70/100][15/29]  lr: 3.4582e-04  eta: 0:46:19  time: 47.1667   loss: 0.0018
+11/08 04:51:10 - Epoch(train)  [70/100][20/29]  lr: 3.2523e-04  eta: 0:39:34  time: 54.0374   loss: 0.0047
+11/08 04:51:22 - Epoch(train)  [70/100][25/29]  lr: 3.0498e-04  eta: 0:38:17  time: 65.7267   loss: 0.0010
+
+11/08 04:51:25 - Epoch(test) - all: [70/100]:
+Threshold is drived from OTSU algorithm.
+11/08 04:51:55 - Epoch(test) : [5/16]
+11/08 04:52:02 - Epoch(test) : [10/16]
+11/08 04:52:08 - Epoch(test) : [15/16]
+Accuracy: 0.90、Precision: 0.66、Recall: 0.89、F1-score: 0.75、Average_Precision: 0.95
+
+11/08 04:52:11 - Epoch(test) - inshore: [70/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.94、Precision: 0.74、Recall: 0.81、F1-score: 0.77、Average_Precision: 0.84
+11/08 04:53:00 - Epoch(train)  [71/100][5/29]  lr: 2.6949e-04  eta: 1:34:49  time: 32.8849   loss: 0.0009
+11/08 04:53:07 - Epoch(train)  [71/100][10/29]  lr: 2.5038e-04  eta: 0:58:14  time: 40.6336   loss: 0.0004
+11/08 04:53:15 - Epoch(train)  [71/100][15/29]  lr: 2.3173e-04  eta: 0:45:40  time: 48.0865   loss: 0.0049
+11/08 04:53:22 - Epoch(train)  [71/100][20/29]  lr: 2.1361e-04  eta: 0:39:1  time: 55.1018   loss: 0.0007
+11/08 04:53:34 - Epoch(train)  [71/100][25/29]  lr: 1.9602e-04  eta: 0:37:39  time: 66.8377   loss: 0.0003
+11/08 04:54:08 - Epoch(train)  [72/100][5/29]  lr: 1.6585e-04  eta: 1:28:33  time: 31.7783   loss: 0.0005
+11/08 04:54:15 - Epoch(train)  [72/100][10/29]  lr: 1.4997e-04  eta: 0:54:0  time: 38.9898   loss: 0.0003
+11/08 04:54:22 - Epoch(train)  [72/100][15/29]  lr: 1.3476e-04  eta: 0:42:4  time: 45.8503   loss: 0.0004
+11/08 04:54:29 - Epoch(train)  [72/100][20/29]  lr: 1.2024e-04  eta: 0:36:18  time: 53.0746   loss: 0.0005
+11/08 04:54:42 - Epoch(train)  [72/100][25/29]  lr: 1.0644e-04  eta: 0:35:44  time: 65.6964   loss: 0.0037
+11/08 04:55:18 - Epoch(train)  [73/100][5/29]  lr: 8.3516e-05  eta: 1:25:49  time: 31.9042   loss: 0.0001
+11/08 04:55:25 - Epoch(train)  [73/100][10/29]  lr: 7.1881e-05  eta: 0:52:26  time: 39.2385   loss: 0.0001
+11/08 04:55:32 - Epoch(train)  [73/100][15/29]  lr: 6.1061e-05  eta: 0:40:58  time: 46.2775   loss: 0.0001
+11/08 04:55:39 - Epoch(train)  [73/100][20/29]  lr: 5.1078e-05  eta: 0:35:2  time: 53.0844   loss: 0.0003
+11/08 04:56:00 - Epoch(train)  [73/100][25/29]  lr: 4.1949e-05  eta: 0:39:1  time: 74.3813   loss: 0.0005
+11/08 04:56:43 - Epoch(train)  [74/100][5/29]  lr: 2.7727e-05  eta: 1:41:47  time: 39.2512   loss: 0.0002
+11/08 04:56:51 - Epoch(train)  [74/100][10/29]  lr: 2.1080e-05  eta: 1:0:48  time: 47.1989   loss: 0.0002
+11/08 04:57:01 - Epoch(train)  [74/100][15/29]  lr: 1.5345e-05  eta: 0:48:50  time: 57.2432   loss: 0.0032
+11/08 04:57:14 - Epoch(train)  [74/100][20/29]  lr: 1.0533e-05  eta: 0:44:43  time: 70.3513   loss: 0.0002
+11/08 04:57:35 - Epoch(train)  [74/100][25/29]  lr: 6.6528e-06  eta: 0:46:14  time: 91.5232   loss: 0.0003
+11/08 04:58:13 - Epoch(train)  [75/100][5/29]  lr: 2.0406e-06  eta: 1:24:19  time: 33.7718   loss: 0.0002
+11/08 04:58:20 - Epoch(train)  [75/100][10/29]  lr: 8.0443e-07  eta: 0:50:37  time: 40.8235   loss: 0.0002
+11/08 04:58:30 - Epoch(train)  [75/100][15/29]  lr: 9.9998e-04  eta: 0:42:9  time: 51.3411   loss: 0.0003
+11/08 04:58:37 - Epoch(train)  [75/100][20/29]  lr: 9.9932e-04  eta: 0:35:34  time: 58.1701   loss: 0.0002
+11/08 04:58:50 - Epoch(train)  [75/100][25/29]  lr: 9.9770e-04  eta: 0:34:24  time: 70.8113   loss: 0.0002
+
+11/08 04:58:53 - Epoch(test) - all: [75/100]:
+Threshold is drived from OTSU algorithm.
+11/08 04:59:23 - Epoch(test) : [5/16]
+11/08 04:59:31 - Epoch(test) : [10/16]
+11/08 04:59:37 - Epoch(test) : [15/16]
+Accuracy: 0.85、Precision: 0.56、Recall: 0.89、F1-score: 0.69、Average_Precision: 0.95
+
+11/08 04:59:40 - Epoch(test) - inshore: [75/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.92、Precision: 0.65、Recall: 0.80、F1-score: 0.72、Average_Precision: 0.84
+11/08 05:00:28 - Epoch(train)  [76/100][5/29]  lr: 9.9241e-04  eta: 1:14:29  time: 31.0365   loss: 0.0001
+11/08 05:00:36 - Epoch(train)  [76/100][10/29]  lr: 9.8815e-04  eta: 0:46:16  time: 38.8320   loss: 0.0002
+11/08 05:00:43 - Epoch(train)  [76/100][15/29]  lr: 9.8297e-04  eta: 0:36:15  time: 45.9522   loss: 0.0001
+11/08 05:00:51 - Epoch(train)  [76/100][20/29]  lr: 9.7687e-04  eta: 0:31:40  time: 53.9198   loss: 0.0029
+11/08 05:01:03 - Epoch(train)  [76/100][25/29]  lr: 9.6986e-04  eta: 0:30:46  time: 65.9589   loss: 0.0051
+11/08 05:01:38 - Epoch(train)  [77/100][5/29]  lr: 9.5500e-04  eta: 1:8:28  time: 29.7319   loss: 0.0043
+11/08 05:01:46 - Epoch(train)  [77/100][10/29]  lr: 9.4553e-04  eta: 0:42:34  time: 37.2440   loss: 0.0142
+11/08 05:01:52 - Epoch(train)  [77/100][15/29]  lr: 9.3521e-04  eta: 0:33:10  time: 43.8526   loss: 0.0144
+11/08 05:01:59 - Epoch(train)  [77/100][20/29]  lr: 9.2406e-04  eta: 0:28:32  time: 50.6668   loss: 0.0128
+11/08 05:02:11 - Epoch(train)  [77/100][25/29]  lr: 9.1211e-04  eta: 0:28:7  time: 62.8741   loss: 0.0142
+11/08 05:02:45 - Epoch(train)  [78/100][5/29]  lr: 8.8863e-04  eta: 1:6:39  time: 30.2108   loss: 0.0398
+11/08 05:02:52 - Epoch(train)  [78/100][10/29]  lr: 8.7454e-04  eta: 0:40:16  time: 36.7792   loss: 0.0235
+11/08 05:03:00 - Epoch(train)  [78/100][15/29]  lr: 8.5974e-04  eta: 0:32:56  time: 45.4731   loss: 0.0198
+11/08 05:03:08 - Epoch(train)  [78/100][20/29]  lr: 8.4426e-04  eta: 0:28:41  time: 53.2054   loss: 0.0180
+11/08 05:03:19 - Epoch(train)  [78/100][25/29]  lr: 8.2812e-04  eta: 0:27:32  time: 64.3486   loss: 0.0211
+11/08 05:03:52 - Epoch(train)  [79/100][5/29]  lr: 7.9751e-04  eta: 1:0:2  time: 28.4592   loss: 0.0143
+11/08 05:04:01 - Epoch(train)  [79/100][10/29]  lr: 7.7971e-04  eta: 0:39:20  time: 37.5803   loss: 0.0103
+11/08 05:04:08 - Epoch(train)  [79/100][15/29]  lr: 7.6137e-04  eta: 0:31:10  time: 45.0323   loss: 0.0128
+11/08 05:04:16 - Epoch(train)  [79/100][20/29]  lr: 7.4253e-04  eta: 0:27:14  time: 52.8856   loss: 0.0121
+11/08 05:04:25 - Epoch(train)  [79/100][25/29]  lr: 7.2324e-04  eta: 0:25:14  time: 61.7496   loss: 0.0103
+11/08 05:05:00 - Epoch(train)  [80/100][5/29]  lr: 6.8746e-04  eta: 0:58:55  time: 29.2677   loss: 0.0039
+11/08 05:05:07 - Epoch(train)  [80/100][10/29]  lr: 6.6707e-04  eta: 0:36:7  time: 36.1914   loss: 0.0029
+11/08 05:05:15 - Epoch(train)  [80/100][15/29]  lr: 6.4636e-04  eta: 0:28:44  time: 43.5543   loss: 0.0045
+11/08 05:05:22 - Epoch(train)  [80/100][20/29]  lr: 6.2538e-04  eta: 0:25:1  time: 50.9957   loss: 0.0045
+11/08 05:05:35 - Epoch(train)  [80/100][25/29]  lr: 6.0415e-04  eta: 0:24:48  time: 63.7191   loss: 0.0108
+
+11/08 05:05:39 - Epoch(test) - all: [80/100]:
+Threshold is drived from OTSU algorithm.
+11/08 05:06:10 - Epoch(test) : [5/16]
+11/08 05:06:17 - Epoch(test) : [10/16]
+11/08 05:06:24 - Epoch(test) : [15/16]
+Accuracy: 0.88、Precision: 0.63、Recall: 0.87、F1-score: 0.73、Average_Precision: 0.94
+
+11/08 05:06:26 - Epoch(test) - inshore: [80/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.94、Precision: 0.73、Recall: 0.77、F1-score: 0.75、Average_Precision: 0.83
+11/08 05:07:16 - Epoch(train)  [81/100][5/29]  lr: 5.6548e-04  eta: 1:1:54  time: 32.3002   loss: 0.0042
+11/08 05:07:24 - Epoch(train)  [81/100][10/29]  lr: 5.4381e-04  eta: 0:38:11  time: 40.1979   loss: 0.0014
+11/08 05:07:31 - Epoch(train)  [81/100][15/29]  lr: 5.2205e-04  eta: 0:29:50  time: 47.5445   loss: 0.0015
+11/08 05:07:39 - Epoch(train)  [81/100][20/29]  lr: 5.0025e-04  eta: 0:25:38  time: 54.9418   loss: 0.0030
+11/08 05:07:50 - Epoch(train)  [81/100][25/29]  lr: 4.7845e-04  eta: 0:24:21  time: 65.8209   loss: 0.0024
+11/08 05:08:25 - Epoch(train)  [82/100][5/29]  lr: 4.3935e-04  eta: 0:56:36  time: 31.1063   loss: 0.0013
+11/08 05:08:32 - Epoch(train)  [82/100][10/29]  lr: 4.1777e-04  eta: 0:34:56  time: 38.7505   loss: 0.0010
+11/08 05:08:40 - Epoch(train)  [82/100][15/29]  lr: 3.9635e-04  eta: 0:27:28  time: 46.1260   loss: 0.0009
+11/08 05:08:47 - Epoch(train)  [82/100][20/29]  lr: 3.7512e-04  eta: 0:23:35  time: 53.2966   loss: 0.0014
+11/08 05:08:59 - Epoch(train)  [82/100][25/29]  lr: 3.5414e-04  eta: 0:22:47  time: 65.0039   loss: 0.0005
+11/08 05:09:33 - Epoch(train)  [83/100][5/29]  lr: 3.1709e-04  eta: 0:53:1  time: 30.7736   loss: 0.0004
+11/08 05:09:40 - Epoch(train)  [83/100][10/29]  lr: 2.9698e-04  eta: 0:32:16  time: 37.8146   loss: 0.0004
+11/08 05:09:48 - Epoch(train)  [83/100][15/29]  lr: 2.7726e-04  eta: 0:25:36  time: 45.4483   loss: 0.0002
+11/08 05:09:55 - Epoch(train)  [83/100][20/29]  lr: 2.5797e-04  eta: 0:22:3  time: 52.7321   loss: 0.0005
+11/08 05:10:07 - Epoch(train)  [83/100][25/29]  lr: 2.3913e-04  eta: 0:21:25  time: 64.6820   loss: 0.0004
+11/08 05:10:40 - Epoch(train)  [84/100][5/29]  lr: 2.0650e-04  eta: 0:47:21  time: 29.1153   loss: 0.0002
+11/08 05:10:48 - Epoch(train)  [84/100][10/29]  lr: 1.8915e-04  eta: 0:29:43  time: 36.9164   loss: 0.0001
+11/08 05:10:55 - Epoch(train)  [84/100][15/29]  lr: 1.7238e-04  eta: 0:23:40  time: 44.5881   loss: 0.0003
+11/08 05:11:02 - Epoch(train)  [84/100][20/29]  lr: 1.5624e-04  eta: 0:20:22  time: 51.6845   loss: 0.0002
+11/08 05:11:15 - Epoch(train)  [84/100][25/29]  lr: 1.4076e-04  eta: 0:20:8  time: 64.5310   loss: 0.0001
+11/08 05:11:49 - Epoch(train)  [85/100][5/29]  lr: 1.1463e-04  eta: 0:45:19  time: 29.6196   loss: 0.0001
+11/08 05:11:56 - Epoch(train)  [85/100][10/29]  lr: 1.0113e-04  eta: 0:27:45  time: 36.6884   loss: 0.0001
+11/08 05:12:03 - Epoch(train)  [85/100][15/29]  lr: 8.8393e-05  eta: 0:21:33  time: 43.2171   loss: 0.0002
+11/08 05:12:10 - Epoch(train)  [85/100][20/29]  lr: 7.6438e-05  eta: 0:18:50  time: 50.9129   loss: 0.0001
+11/08 05:12:22 - Epoch(train)  [85/100][25/29]  lr: 6.5290e-05  eta: 0:18:22  time: 62.8094   loss: 0.0002
+
+11/08 05:12:26 - Epoch(test) - all: [85/100]:
+Threshold is drived from OTSU algorithm.
+11/08 05:12:57 - Epoch(test) : [5/16]
+11/08 05:13:05 - Epoch(test) : [10/16]
+11/08 05:13:11 - Epoch(test) : [15/16]
+Accuracy: 0.86、Precision: 0.56、Recall: 0.89、F1-score: 0.69、Average_Precision: 0.95
+
+11/08 05:13:13 - Epoch(test) - inshore: [85/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.92、Precision: 0.63、Recall: 0.81、F1-score: 0.71、Average_Precision: 0.84
+11/08 05:14:00 - Epoch(train)  [86/100][5/29]  lr: 4.7323e-05  eta: 0:44:2  time: 30.7300   loss: 0.0001
+11/08 05:14:09 - Epoch(train)  [86/100][10/29]  lr: 3.8541e-05  eta: 0:27:35  time: 38.9636   loss: 0.0001
+11/08 05:14:17 - Epoch(train)  [86/100][15/29]  lr: 3.0639e-05  eta: 0:21:52  time: 46.8776   loss: 0.0001
+11/08 05:14:24 - Epoch(train)  [86/100][20/29]  lr: 2.3630e-05  eta: 0:18:49  time: 54.4299   loss: 0.0001
+11/08 05:14:36 - Epoch(train)  [86/100][25/29]  lr: 1.7529e-05  eta: 0:18:6  time: 66.2705   loss: 0.0001
+11/08 05:15:11 - Epoch(train)  [87/100][5/29]  lr: 8.8684e-06  eta: 0:42:39  time: 31.9114   loss: 0.0001
+11/08 05:15:19 - Epoch(train)  [87/100][10/29]  lr: 5.3635e-06  eta: 0:26:0  time: 39.4070   loss: 0.0001
+11/08 05:15:26 - Epoch(train)  [87/100][15/29]  lr: 2.8007e-06  eta: 0:20:26  time: 47.0696   loss: 0.0001
+11/08 05:15:34 - Epoch(train)  [87/100][20/29]  lr: 1.1849e-06  eta: 0:17:31  time: 54.4834   loss: 0.0001
+11/08 05:15:47 - Epoch(train)  [87/100][25/29]  lr: 5.1903e-07  eta: 0:17:7  time: 67.4342   loss: 0.0001
+11/08 05:16:20 - Epoch(train)  [88/100][5/29]  lr: 9.9878e-04  eta: 0:37:15  time: 30.0417   loss: 0.0001
+11/08 05:16:28 - Epoch(train)  [88/100][10/29]  lr: 9.9679e-04  eta: 0:22:44  time: 37.1663   loss: 0.0001
+11/08 05:16:37 - Epoch(train)  [88/100][15/29]  lr: 9.9385e-04  eta: 0:18:49  time: 46.7967   loss: 0.0001
+11/08 05:16:45 - Epoch(train)  [88/100][20/29]  lr: 9.8997e-04  eta: 0:16:8  time: 54.2782   loss: 0.0001
+11/08 05:16:55 - Epoch(train)  [88/100][25/29]  lr: 9.8516e-04  eta: 0:15:15  time: 65.0453   loss: 0.0001
+11/08 05:17:32 - Epoch(train)  [89/100][5/29]  lr: 9.7417e-04  eta: 0:36:51  time: 32.2389   loss: 0.0001
+11/08 05:17:39 - Epoch(train)  [89/100][10/29]  lr: 9.6681e-04  eta: 0:22:1  time: 39.0876   loss: 0.0001
+11/08 05:17:46 - Epoch(train)  [89/100][15/29]  lr: 9.5855e-04  eta: 0:17:4  time: 46.1370   loss: 0.0006
+11/08 05:17:53 - Epoch(train)  [89/100][20/29]  lr: 9.4942e-04  eta: 0:14:35  time: 53.3745   loss: 0.0001
+11/08 05:18:05 - Epoch(train)  [89/100][25/29]  lr: 9.3944e-04  eta: 0:13:59  time: 64.9560   loss: 0.0001
+11/08 05:18:38 - Epoch(train)  [90/100][5/29]  lr: 9.1938e-04  eta: 0:31:40  time: 30.2686   loss: 0.0001
+11/08 05:18:46 - Epoch(train)  [90/100][10/29]  lr: 9.0710e-04  eta: 0:19:20  time: 37.5525   loss: 0.0001
+11/08 05:18:53 - Epoch(train)  [90/100][15/29]  lr: 8.9406e-04  eta: 0:15:6  time: 44.7469   loss: 0.0003
+11/08 05:19:00 - Epoch(train)  [90/100][20/29]  lr: 8.8026e-04  eta: 0:12:52  time: 51.6652   loss: 0.0001
+11/08 05:19:13 - Epoch(train)  [90/100][25/29]  lr: 8.6574e-04  eta: 0:12:41  time: 64.7865   loss: 0.0001
+
+11/08 05:19:16 - Epoch(test) - all: [90/100]:
+Threshold is drived from OTSU algorithm.
+11/08 05:19:45 - Epoch(test) : [5/16]
+11/08 05:19:53 - Epoch(test) : [10/16]
+11/08 05:20:00 - Epoch(test) : [15/16]
+Accuracy: 0.84、Precision: 0.54、Recall: 0.90、F1-score: 0.68、Average_Precision: 0.95
+
+11/08 05:20:02 - Epoch(test) - inshore: [90/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.92、Precision: 0.62、Recall: 0.81、F1-score: 0.70、Average_Precision: 0.84
+11/08 05:20:48 - Epoch(train)  [91/100][5/29]  lr: 8.3788e-04  eta: 0:29:11  time: 30.7200   loss: 0.0002
+11/08 05:20:59 - Epoch(train)  [91/100][10/29]  lr: 8.2148e-04  eta: 0:19:11  time: 41.1286   loss: 0.0005
+11/08 05:21:07 - Epoch(train)  [91/100][15/29]  lr: 8.0448e-04  eta: 0:14:59  time: 49.0901   loss: 0.0003
+11/08 05:21:14 - Epoch(train)  [91/100][20/29]  lr: 7.8689e-04  eta: 0:12:38  time: 56.2119   loss: 0.0011
+11/08 05:21:24 - Epoch(train)  [91/100][25/29]  lr: 7.6877e-04  eta: 0:11:44  time: 66.4157   loss: 0.0004
+11/08 05:21:59 - Epoch(train)  [92/100][5/29]  lr: 7.3487e-04  eta: 0:25:26  time: 29.8200   loss: 0.0042
+11/08 05:22:06 - Epoch(train)  [92/100][10/29]  lr: 7.1540e-04  eta: 0:15:38  time: 37.3868   loss: 0.0029
+11/08 05:22:13 - Epoch(train)  [92/100][15/29]  lr: 6.9552e-04  eta: 0:12:12  time: 44.6434   loss: 0.0062
+11/08 05:22:20 - Epoch(train)  [92/100][20/29]  lr: 6.7527e-04  eta: 0:10:24  time: 51.7862   loss: 0.0041
+11/08 05:22:32 - Epoch(train)  [92/100][25/29]  lr: 6.5468e-04  eta: 0:10:0  time: 63.6297   loss: 0.0078
+11/08 05:23:09 - Epoch(train)  [93/100][5/29]  lr: 6.1691e-04  eta: 0:24:5  time: 31.8464   loss: 0.0121
+11/08 05:23:16 - Epoch(train)  [93/100][10/29]  lr: 5.9561e-04  eta: 0:14:30  time: 39.2057   loss: 0.0078
+11/08 05:23:23 - Epoch(train)  [93/100][15/29]  lr: 5.7412e-04  eta: 0:11:12  time: 46.4659   loss: 0.0098
+11/08 05:23:30 - Epoch(train)  [93/100][20/29]  lr: 5.5249e-04  eta: 0:9:27  time: 53.5008   loss: 0.0057
+11/08 05:23:43 - Epoch(train)  [93/100][25/29]  lr: 5.3076e-04  eta: 0:9:7  time: 66.1629   loss: 0.0108
+11/08 05:24:16 - Epoch(train)  [94/100][5/29]  lr: 4.9153e-04  eta: 0:19:48  time: 30.0068   loss: 0.0041
+11/08 05:24:24 - Epoch(train)  [94/100][10/29]  lr: 4.6974e-04  eta: 0:12:11  time: 37.8948   loss: 0.0027
+11/08 05:24:31 - Epoch(train)  [94/100][15/29]  lr: 4.4801e-04  eta: 0:9:18  time: 44.5882   loss: 0.0020
+11/08 05:24:38 - Epoch(train)  [94/100][20/29]  lr: 4.2638e-04  eta: 0:7:54  time: 51.8197   loss: 0.0059
+11/08 05:24:50 - Epoch(train)  [94/100][25/29]  lr: 4.0489e-04  eta: 0:7:39  time: 64.4721   loss: 0.0027
+11/08 05:25:28 - Epoch(train)  [95/100][5/29]  lr: 3.6670e-04  eta: 0:18:2  time: 32.0304   loss: 0.0033
+11/08 05:25:36 - Epoch(train)  [95/100][10/29]  lr: 3.4582e-04  eta: 0:10:50  time: 39.6542   loss: 0.0010
+11/08 05:25:43 - Epoch(train)  [95/100][15/29]  lr: 3.2523e-04  eta: 0:8:18  time: 47.0715   loss: 0.0015
+11/08 05:25:50 - Epoch(train)  [95/100][20/29]  lr: 3.0498e-04  eta: 0:6:54  time: 53.7974   loss: 0.0006
+11/08 05:26:04 - Epoch(train)  [95/100][25/29]  lr: 2.8510e-04  eta: 0:6:42  time: 67.4785   loss: 0.0022
+
+11/08 05:26:07 - Epoch(test) - all: [95/100]:
+Threshold is drived from OTSU algorithm.
+11/08 05:26:39 - Epoch(test) : [5/16]
+11/08 05:26:46 - Epoch(test) : [10/16]
+11/08 05:26:53 - Epoch(test) : [15/16]
+Accuracy: 0.87、Precision: 0.59、Recall: 0.90、F1-score: 0.71、Average_Precision: 0.94
+
+11/08 05:26:56 - Epoch(test) - inshore: [95/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.94、Precision: 0.72、Recall: 0.81、F1-score: 0.76、Average_Precision: 0.83
+11/08 05:27:45 - Epoch(train)  [96/100][5/29]  lr: 2.5038e-04  eta: 0:15:9  time: 32.4928   loss: 0.0007
+11/08 05:27:53 - Epoch(train)  [96/100][10/29]  lr: 2.3173e-04  eta: 0:9:3  time: 40.2444   loss: 0.0014
+11/08 05:28:00 - Epoch(train)  [96/100][15/29]  lr: 2.1361e-04  eta: 0:6:51  time: 47.4249   loss: 0.0002
+11/08 05:28:08 - Epoch(train)  [96/100][20/29]  lr: 1.9602e-04  eta: 0:5:43  time: 54.9393   loss: 0.0004
+11/08 05:28:20 - Epoch(train)  [96/100][25/29]  lr: 1.7902e-04  eta: 0:5:20  time: 66.8678   loss: 0.0049
+11/08 05:28:55 - Epoch(train)  [97/100][5/29]  lr: 1.4997e-04  eta: 0:11:44  time: 31.7285   loss: 0.0012
+11/08 05:29:02 - Epoch(train)  [97/100][10/29]  lr: 1.3476e-04  eta: 0:6:50  time: 38.7709   loss: 0.0003
+11/08 05:29:09 - Epoch(train)  [97/100][15/29]  lr: 1.2024e-04  eta: 0:5:6  time: 45.4835   loss: 0.0007
+11/08 05:29:16 - Epoch(train)  [97/100][20/29]  lr: 1.0644e-04  eta: 0:4:16  time: 53.3374   loss: 0.0043
+11/08 05:29:29 - Epoch(train)  [97/100][25/29]  lr: 9.3396e-05  eta: 0:4:1  time: 66.2370   loss: 0.0001
+11/08 05:30:03 - Epoch(train)  [98/100][5/29]  lr: 7.1881e-05  eta: 0:8:16  time: 30.2671   loss: 0.0001
+11/08 05:30:10 - Epoch(train)  [98/100][10/29]  lr: 6.1061e-05  eta: 0:4:47  time: 37.3278   loss: 0.0002
+11/08 05:30:17 - Epoch(train)  [98/100][15/29]  lr: 5.1078e-05  eta: 0:3:33  time: 44.4148   loss: 0.0006
+11/08 05:30:24 - Epoch(train)  [98/100][20/29]  lr: 4.1949e-05  eta: 0:2:53  time: 51.8065   loss: 0.0002
+11/08 05:30:38 - Epoch(train)  [98/100][25/29]  lr: 3.3693e-05  eta: 0:2:41  time: 65.2024   loss: 0.0001
+11/08 05:31:12 - Epoch(train)  [99/100][5/29]  lr: 2.1080e-05  eta: 0:5:27  time: 30.8592   loss: 0.0001
+11/08 05:31:19 - Epoch(train)  [99/100][10/29]  lr: 1.5345e-05  eta: 0:3:3  time: 38.2388   loss: 0.0001
+11/08 05:31:26 - Epoch(train)  [99/100][15/29]  lr: 1.0533e-05  eta: 0:2:9  time: 45.2090   loss: 0.0001
+11/08 05:31:33 - Epoch(train)  [99/100][20/29]  lr: 6.6528e-06  eta: 0:1:38  time: 51.9223   loss: 0.0002
+11/08 05:31:46 - Epoch(train)  [99/100][25/29]  lr: 3.7125e-06  eta: 0:1:25  time: 64.8240   loss: 0.0002
+11/08 05:32:18 - Epoch(train)  [100/100][5/29]  lr: 8.0443e-07  eta: 0:2:17  time: 28.6935   loss: 0.0002
+11/08 05:32:26 - Epoch(train)  [100/100][10/29]  lr: 9.9998e-04  eta: 0:1:9  time: 36.4727   loss: 0.0001
+11/08 05:32:32 - Epoch(train)  [100/100][15/29]  lr: 9.9932e-04  eta: 0:0:40  time: 43.2294   loss: 0.0001
+11/08 05:32:39 - Epoch(train)  [100/100][20/29]  lr: 9.9770e-04  eta: 0:0:22  time: 50.2711   loss: 0.0001
+11/08 05:32:53 - Epoch(train)  [100/100][25/29]  lr: 9.9514e-04  eta: 0:0:10  time: 64.3895   loss: 0.0008
+
+11/08 05:32:57 - Epoch(test) - all: [100/100]:
+Threshold is drived from OTSU algorithm.
+11/08 05:33:27 - Epoch(test) : [5/16]
+11/08 05:33:35 - Epoch(test) : [10/16]
+11/08 05:33:41 - Epoch(test) : [15/16]
+Accuracy: 0.86、Precision: 0.57、Recall: 0.89、F1-score: 0.70、Average_Precision: 0.94
+
+11/08 05:33:43 - Epoch(test) - inshore: [100/100]:
+Threshold is drived from OTSU algorithm.
+Accuracy: 0.93、Precision: 0.66、Recall: 0.80、F1-score: 0.72、Average_Precision: 0.84
+11/08 05:34:00 - Last model saved :work_dirs/SuperPoint+Boost-B-attlay3_last_model_weight.pth
+
+# 这里由于跑多个对比模型, 不同权重名称设置成一样的, 所以加载模型失败。不过影响不大, 海面场景综合模型表现基本上99%
+# 通过日志打印发现,所有测试图片的性能:
+# Best model achieved at epoch 60, with all test image AP 0.9460
+# Accuracy: 0.86、Precision: 0.57、Recall: 0.89、F1-score: 0.70、Average_Precision: 0.95
+# 近岸场景测试图片的性能:
+# Accuracy: 0.93、Precision: 0.67、Recall: 0.81、F1-score: 0.73、Average_Precision: 0.84
