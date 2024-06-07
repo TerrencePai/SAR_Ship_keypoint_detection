@@ -1,0 +1,3 @@
+[submodule "FeatureBooster"]
+	path = FeatureBooster
+	url = https://github.com/SJTU-ViSYS/FeatureBooster.git
