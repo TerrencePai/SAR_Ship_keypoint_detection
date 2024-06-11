@@ -148,6 +148,7 @@ class ShipKeyPointsModel(nn.Module):
 
         self.device = args.device
 
+        #读取Featurebooster的配置文件
         with open(str(Path(__file__).parent / "config.yaml"), 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
         self.config = config[args.descriptor]
@@ -166,6 +167,7 @@ class ShipKeyPointsModel(nn.Module):
         x = self.fc_out(feat)
         return feat, nn.functional.softmax(x, dim=-1)
 
+#旋转矩形框
 def rotate_box_90_degrees(coords):
     x1, y1, x2, y2, x3, y3, x4, y4 = coords
 
@@ -280,6 +282,7 @@ def get_keypoint_label(keypoints, data_info, args):
         bboxes.append(np.array([(instances['bbox'][i], instances['bbox'][i + 1]) for i in range(0, len(instances['bbox']), 2)], dtype=np.int32))
         bbox_label.append(instances['bbox_label'])
 
+    #创建和图像同样大小的空白区域，按照标注填充区域
     tmp = np.zeros(data_info['image_shape'], dtype=np.uint8)
     for box, label in zip(bboxes, bbox_label):
         cv2.fillPoly(tmp, np.array([box]), label)
@@ -358,6 +361,7 @@ class ShipKeyPointsDataset(Dataset):
             image = cv2.cvtColor(cv2.imread(data_info['img_path']), cv2.COLOR_BGR2RGB)
             data_info['image_shape'] = image.shape[:2]
 
+        # 提取关键点和描述子
         try:
             keypoints, descriptors, image = extract_img_feature(self.args.descriptor, image, self.extractor)
         except BaseException as e:
@@ -616,14 +620,17 @@ def keypoint_match(model, args, test_image1, test_image2):
         labels.append(label)
         
     border = 10
+    # 为了使两个图像的关键点对齐，将第二个图像的关键点坐标加上第一个图像的宽度
     kps[1] = np.array([cv2.KeyPoint(kp_i[0] + border + imgs[0].shape[1], kp_i[1], kp_i[2]) for kp_i in kps[1]])
     kps[0] = np.array([cv2.KeyPoint(kp_i[0] , kp_i[1], kp_i[2]) for kp_i in kps[0]])
-      
+    
+    #计算两个图像的关键点之间的距离，找到匹配的关键点
     imgs[1] = cv2.copyMakeBorder(imgs[1], 0, 0, border, 0, cv2.BORDER_CONSTANT, value=[255, 255, 255])
     dis = torch.cdist(torch.from_numpy(descriptors[0]),torch.from_numpy(descriptors[1]))
     matches_AB = torch.argmin(dis,dim=-1).cpu().numpy()
     matches_BA = torch.argmin(dis,dim=0).cpu().numpy()
     
+    #组合两个图像
     h1, w1 = imgs[0].shape[:2]
     h2, w2 = imgs[1].shape[:2]
     height = max(h1, h2)
@@ -632,6 +639,8 @@ def keypoint_match(model, args, test_image1, test_image2):
     img_matches[:h1, :w1, :] = imgs[0]
     img_matches[:h2, w1:(w1 + w2), :] = imgs[1]
 
+
+    # 画出匹配关键点
     for kp_i, label_i in zip(kps, labels):
         for kp_j, label_j in zip(kp_i, label_i):
             pt2 = tuple(np.round(kp_j.pt).astype(int))
@@ -682,6 +691,7 @@ def train(model, args):
     optimizer_class = importlib.import_module('torch.optim').AdamW
     partial = importlib.import_module('functools').partial
     train_pipeline = []
+    #数据增强
     if args.image_aug:
         train_pipeline = [
             dict(type='mmdet.LoadImageFromFile', backend_args=None),
